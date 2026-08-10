@@ -4,6 +4,22 @@ import { addBlocked, isBlockedSync, warm as warmBlocklist } from "../lib/blockli
 import { BRAND } from "../lib/brand";
 import { type Cached, cacheGet, signalsHash } from "../lib/cache";
 import {
+  clearDelayedBlockStop,
+  delayedBlockRateDecision,
+  enqueueDelayedBlock,
+  ensureDelayedStatesForRecords,
+  getDelayedBlockMeta,
+  getDelayedBlockStates,
+  markDelayedBlockProcessing,
+  randomDelayedBlockInterval,
+  recordDelayedBlockAttempt,
+  recordDirectBlockResult,
+  recoverProcessingDelayedBlocks,
+  selectNextDelayedBlock,
+  settleDelayedBlockAttempt,
+  updateDelayedBlockMeta,
+} from "../lib/delayed-block";
+import {
   extractFromArticle,
   extractProfile,
   extractThreadTopic,
@@ -24,10 +40,12 @@ import {
 import { bumpStat } from "../lib/stats";
 import {
   type PendingXAction,
+  type RecordedAction,
   addBlockRecord,
   addPendingAction,
   bumpStats,
   clearPendingAction,
+  getBlocklist,
   getPendingActions,
   updateBlockRecord,
 } from "../lib/store";
@@ -61,6 +79,34 @@ function openAppeal(appeal?: { handle: string; userId?: string }): void {
  *  huge backlog can't fire a burst of X calls at once. The global x-action
  *  lock still paces each one; anything beyond the cap settles on later loads. */
 const RESUME_MAX = 50;
+const DELAYED_BLOCK_RUNNER_LOCK = "mxga-delayed-block-runner";
+
+type RunnerLockNavigator = Navigator & {
+  locks?: {
+    request<T>(
+      name: string,
+      options: { signal: AbortSignal },
+      callback: () => T | Promise<T>,
+    ): Promise<T>;
+  };
+};
+
+function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(done, Math.max(0, ms));
+    function done() {
+      signal.removeEventListener("abort", aborted);
+      resolve();
+    }
+    function aborted() {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", aborted);
+      reject(new DOMException("Aborted", "AbortError"));
+    }
+    signal.addEventListener("abort", aborted, { once: true });
+  });
+}
 
 /** Report an unlisted account to the public review queue. GitHub-authed
  *  contribution: the token gates who can report (server enforces a 90-day
@@ -151,15 +197,47 @@ async function applyXAction(mode: ActionMode, sig: Signals): Promise<boolean> {
   // Load the mutation client only after the user explicitly chooses a native
   // X action and grants the optional host permission.
   const { performXAction, retryDelayForAttempt } = await import("../lib/x-action");
-  const attempt = await performXAction(mode, sig.userId, sig.handle);
-  if (attempt.ok) return true;
-  const delay = retryDelayForAttempt(attempt, 1);
-  if (delay > 0) {
-    await new Promise((r) => setTimeout(r, delay));
-    const second = await performXAction(mode, sig.userId, sig.handle); // one best-effort retry
-    return second.ok;
+  let finalAttempt = await performXAction(mode, sig.userId, sig.handle);
+  if (finalAttempt.ok) {
+    if (mode === "block") {
+      await recordDirectBlockResult(sig.userId, sig.handle, finalAttempt).catch(() => {});
+    }
+    return true;
   }
-  return false;
+  const delay = retryDelayForAttempt(finalAttempt, 1);
+  // 429 is a hard stop for the delayed-action product. Do not let the older
+  // foreground helper's one-retry behavior immediately send another write.
+  if (delay > 0 && finalAttempt.status !== 429) {
+    await new Promise((r) => setTimeout(r, delay));
+    finalAttempt = await performXAction(mode, sig.userId, sig.handle); // one best-effort retry
+  }
+  if (mode === "block") {
+    await recordDirectBlockResult(sig.userId, sig.handle, finalAttempt).catch(() => {});
+  }
+  if (
+    (finalAttempt.status === 401 || finalAttempt.status === 403 || finalAttempt.status === 429) &&
+    (await getSettings()).delayedAutoBlock
+  ) {
+    const now = Date.now();
+    const reason =
+      finalAttempt.status === 401
+        ? "http_401"
+        : finalAttempt.status === 403
+          ? "http_403"
+          : "http_429";
+    const until =
+      finalAttempt.status === 429
+        ? now + Math.max(60 * 60_000, finalAttempt.retryAfterMs ?? 0)
+        : undefined;
+    await updateDelayedBlockMeta({
+      pauseReason: reason,
+      pausedAt: now,
+      pausedUntil: until,
+      nextRunAt: until,
+      lastRunnerAt: now,
+    }).catch(() => {});
+  }
+  return finalAttempt.ok;
 }
 
 /** Cheap author handle from the User-Name link href — no fiber walk, no
@@ -254,6 +332,7 @@ export default defineContentScript({
     const pendingActions = new Map<string, PendingAction>();
     const inFlight = new Set<string>(); // keys currently in process()
     const hitPublicSeen = new Set<string>(); // hitPublic stat: once per account
+    let delayedRunnerAbort: AbortController | null = null;
 
     let settings = await getSettings();
     if (!settings.enabled) return; // master off → don't init (applies next load)
@@ -279,6 +358,7 @@ export default defineContentScript({
         }
         scan();
       }
+      syncDelayedBlockRunner();
     });
 
     // Warm local data structures
@@ -286,6 +366,236 @@ export default defineContentScript({
     await warmLocalIndex();
 
     const keyOf = (s: Signals) => s.userId || `h:${s.handle}`;
+
+    function stopDelayedBlockRunner() {
+      delayedRunnerAbort?.abort();
+      delayedRunnerAbort = null;
+    }
+
+    function syncDelayedBlockRunner() {
+      if (!settings.enabled || !settings.delayedAutoBlock) {
+        stopDelayedBlockRunner();
+        return;
+      }
+      if (delayedRunnerAbort && !delayedRunnerAbort.signal.aborted) return;
+      const controller = new AbortController();
+      delayedRunnerAbort = controller;
+      void runDelayedBlockRunner(controller.signal)
+        .catch((error) => {
+          if ((error as { name?: string })?.name !== "AbortError") {
+            console.warn("[MXGA] 延迟拉黑调度器停止", error);
+          }
+        })
+        .finally(() => {
+          if (delayedRunnerAbort === controller) delayedRunnerAbort = null;
+        });
+    }
+
+    async function runDelayedBlockRunner(signal: AbortSignal): Promise<void> {
+      const run = async () => {
+        await recoverProcessingDelayedBlocks();
+        while (!signal.aborted) {
+          const now = Date.now();
+          try {
+            const liveSettings = await getSettings();
+            if (!liveSettings.enabled || !liveSettings.delayedAutoBlock) {
+              await updateDelayedBlockMeta({
+                pauseReason: "disabled",
+                pausedAt: now,
+                pausedUntil: undefined,
+                nextRunAt: undefined,
+                lastRunnerAt: now,
+              });
+              return;
+            }
+
+            const currentViewer = viewerHandle()?.toLowerCase();
+            let owner = liveSettings.delayedBlockOwnerHandle.trim().replace(/^@+/, "").toLowerCase();
+            if (!currentViewer) {
+              await updateDelayedBlockMeta({
+                pauseReason: "not_logged_in",
+                pausedAt: now,
+                pausedUntil: undefined,
+                nextRunAt: undefined,
+                lastRunnerAt: now,
+              });
+              await abortableSleep(30_000, signal);
+              continue;
+            }
+            // Backward-safe fallback for a setting imported/enabled without
+            // going through the options-page switch. Normal enables bind in
+            // the click handler, where the permission prompt is user-driven.
+            if (!owner) {
+              await setSetting("delayedBlockOwnerHandle", currentViewer);
+              owner = currentViewer;
+            }
+            if (currentViewer !== owner) {
+              await updateDelayedBlockMeta({
+                pauseReason: "account_mismatch",
+                pausedAt: now,
+                pausedUntil: undefined,
+                nextRunAt: undefined,
+                lastRunnerAt: now,
+              });
+              await abortableSleep(30_000, signal);
+              continue;
+            }
+
+            const records = await getBlocklist();
+            const states = await ensureDelayedStatesForRecords(records, now);
+            let meta = await getDelayedBlockMeta();
+
+            if (meta.pauseReason === "http_401" || meta.pauseReason === "http_403") {
+              return; // explicit off/on is required to clear an auth/permission stop
+            }
+            if (meta.pauseReason === "http_429") {
+              const until = meta.pausedUntil ?? now + 60 * 60_000;
+              if (until > now) {
+                await updateDelayedBlockMeta({ nextRunAt: until, lastRunnerAt: now });
+                await abortableSleep(Math.min(30_000, until - now), signal);
+                continue;
+              }
+              await clearDelayedBlockStop();
+              meta = await getDelayedBlockMeta();
+            }
+
+            const rate = delayedBlockRateDecision(meta.attemptTimestamps, now);
+            if (!rate.allowed) {
+              await updateDelayedBlockMeta({
+                pauseReason: rate.reason,
+                pausedAt: now,
+                pausedUntil: rate.nextAt,
+                nextRunAt: rate.nextAt,
+                lastRunnerAt: now,
+              });
+              await abortableSleep(Math.min(30_000, Math.max(1_000, (rate.nextAt ?? now) - now)), signal);
+              continue;
+            }
+
+            if ((meta.nextRunAt ?? 0) > now) {
+              await abortableSleep(Math.min(30_000, (meta.nextRunAt ?? now) - now), signal);
+              continue;
+            }
+
+            const next = selectNextDelayedBlock(records, states, now);
+            if (!next) {
+              await updateDelayedBlockMeta({
+                pauseReason: "idle",
+                pausedAt: now,
+                pausedUntil: undefined,
+                nextRunAt: undefined,
+                lastRunnerAt: now,
+              });
+              await abortableSleep(30_000, signal);
+              continue;
+            }
+
+            // Re-read all safety inputs immediately before committing the
+            // attempt: the user may have restored the row, disabled the
+            // switch, or changed X accounts while this tab was waiting.
+            const latestSettings = await getSettings();
+            const latestRecords = await getBlocklist();
+            const latestMeta = await getDelayedBlockMeta();
+            const stillPresent = latestRecords.some((record) => record.id === next.userId);
+            const latestViewer = viewerHandle()?.toLowerCase();
+            const latestRate = delayedBlockRateDecision(latestMeta.attemptTimestamps, Date.now());
+            const hardStopped =
+              latestMeta.pauseReason === "http_401" ||
+              latestMeta.pauseReason === "http_403" ||
+              (latestMeta.pauseReason === "http_429" && (latestMeta.pausedUntil ?? Number.POSITIVE_INFINITY) > Date.now());
+            if (
+              !latestSettings.enabled ||
+              !latestSettings.delayedAutoBlock ||
+              latestViewer !== owner ||
+              !stillPresent ||
+              hardStopped ||
+              !latestRate.allowed ||
+              (latestMeta.nextRunAt ?? 0) > Date.now()
+            ) {
+              await abortableSleep(1_000, signal);
+              continue;
+            }
+
+            // Count before POSTing. If the page dies after this write, the
+            // limiter errs on the safe side instead of forgetting a request.
+            const reservation = await recordDelayedBlockAttempt(Date.now());
+            if (!reservation) {
+              await abortableSleep(1_000, signal);
+              continue;
+            }
+            const processing = await markDelayedBlockProcessing(next.userId, Date.now());
+            if (!processing) continue;
+            const { performXAction } = await import("../lib/x-action");
+            const attempt = await performXAction("block", next.userId, next.handle, {
+              signal,
+              shouldProceed: async () => {
+                const [finalSettings, finalRecords, finalMeta] = await Promise.all([
+                  getSettings(),
+                  getBlocklist(),
+                  getDelayedBlockMeta(),
+                ]);
+                const finalViewer = viewerHandle()?.toLowerCase();
+                const finalHardStop =
+                  finalMeta.pauseReason === "http_401" ||
+                  finalMeta.pauseReason === "http_403" ||
+                  (finalMeta.pauseReason === "http_429" &&
+                    (finalMeta.pausedUntil ?? Number.POSITIVE_INFINITY) > Date.now());
+                return (
+                  finalSettings.enabled &&
+                  finalSettings.delayedAutoBlock &&
+                  finalViewer === owner &&
+                  finalRecords.some((record) => record.id === next.userId) &&
+                  !finalHardStop
+                );
+              },
+            });
+            if (attempt.aborted || signal.aborted) {
+              await recoverProcessingDelayedBlocks().catch(() => {});
+              return;
+            }
+            const settled = await settleDelayedBlockAttempt(next.userId, attempt, Date.now());
+            const after = Date.now();
+            if (settled?.stop) {
+              await updateDelayedBlockMeta({
+                pauseReason: settled.stop.reason,
+                pausedAt: after,
+                pausedUntil: settled.stop.until,
+                nextRunAt: settled.stop.until,
+                lastRunnerAt: after,
+              });
+              if (settled.stop.reason === "http_401" || settled.stop.reason === "http_403") return;
+              continue;
+            }
+            await updateDelayedBlockMeta({
+              pauseReason: undefined,
+              pausedAt: undefined,
+              pausedUntil: undefined,
+              nextRunAt: after + randomDelayedBlockInterval(),
+              lastRunnerAt: after,
+            });
+          } catch (error) {
+            if (signal.aborted || (error as { name?: string })?.name === "AbortError") throw error;
+            await recoverProcessingDelayedBlocks().catch(() => {});
+            await updateDelayedBlockMeta({
+              pauseReason: "storage_error",
+              pausedAt: now,
+              pausedUntil: now + 5 * 60_000,
+              nextRunAt: now + 5 * 60_000,
+              lastRunnerAt: now,
+            }).catch(() => {});
+            console.warn("[MXGA] 延迟拉黑本轮失败，5 分钟后重试", error);
+            await abortableSleep(5 * 60_000, signal);
+          }
+        }
+      };
+
+      const locks = (navigator as RunnerLockNavigator).locks;
+      if (locks) await locks.request(DELAYED_BLOCK_RUNNER_LOCK, { signal }, run);
+      else await run();
+    }
+
+    syncDelayedBlockRunner();
+    ctx.onInvalidated(stopDelayedBlockRunner);
 
     /** Schedule a hide action with a 5-second undo window. `mode` overrides
      *  settings.actionMode for this one action (popover 隐藏 → "local"). */
@@ -356,9 +666,15 @@ export default defineContentScript({
         ...(sig.avatarUrl ? { avatarUrl: sig.avatarUrl } : {}),
         ...(tweetId ? { tweetId } : {}),
         ...(tweetText ? { tweetText } : {}),
+        requestedAction: mode === "local" ? "hide" : mode,
+        effectiveAction: mode === "local" ? "hide" : mode,
+        delayedBlockEligible: mode === "local",
         source: "manual",
         ts: Date.now(),
       });
+      if (mode === "local") {
+        void enqueueDelayedBlock(sig.userId, sig.handle).catch(() => {});
+      }
       void bumpStats({ blocks: 1 });
       void bumpStat("blocked");
       // X recycles article nodes: only hide via the captured anchor if it
@@ -439,6 +755,8 @@ export default defineContentScript({
       key: string;
       sig: Signals;
       action: CategoryAction;
+      requestedAction: RecordedAction;
+      delayedBlockEligible: boolean;
       verb: string;
       anchor: HTMLElement;
       verdict: Verdict;
@@ -490,9 +808,15 @@ export default defineContentScript({
         ...(tweetText ? { tweetText } : {}),
         verdict: it.verdict,
         reason: `${it.categoryZh} · 自动${it.verb}`,
+        requestedAction: it.requestedAction,
+        effectiveAction: it.action as RecordedAction,
+        delayedBlockEligible: it.delayedBlockEligible,
         source: "auto",
         ts: Date.now(),
       });
+      if (it.action === "hide" && it.delayedBlockEligible) {
+        void enqueueDelayedBlock(it.sig.userId, it.sig.handle).catch(() => {});
+      }
       // Track the not-yet-fired X action separately (see PendingXAction): a
       // mid-queue reload can then tell a queued account apart from a completed
       // one — resuming it instead of falsely counting it as 已处理. Local-only
@@ -604,9 +928,24 @@ export default defineContentScript({
      *  attempted at most once, then cleared regardless of outcome. */
     async function resumeInterrupted(pending: PendingXAction[]) {
       // The user switched the mode to local (no more X actions) — honor that:
-      // just settle the markers so these move into the normal 已处理 history.
+      // settle the markers instead of firing immediately. A previously
+      // requested block is recorded as an unfinished direct block so the
+      // separate delayed-block opt-in may retry it later; mutes are never
+      // upgraded to blocks.
       if (settings.actionMode === "local") {
-        for (const p of pending) void clearPendingAction(p.id);
+        for (const p of pending) {
+          if (p.action === "block") {
+            void recordDirectBlockResult(
+              /^\d+$/.test(p.id) ? p.id : undefined,
+              p.handle,
+              { ok: false, retryable: true },
+            ).catch(() => {});
+          }
+          void updateBlockRecord(p.id, {
+            reason: `X ${p.action === "block" ? "拉黑" : "静音"}未执行（已切换为本地模式，仅本地隐藏）`,
+          });
+          void clearPendingAction(p.id);
+        }
         return;
       }
       for (const p of pending.slice(0, RESUME_MAX)) {
@@ -738,8 +1077,9 @@ export default defineContentScript({
       // Auto-published (non-human) list entries are capped by autoTierMode:
       // under the default "hide" they may auto-hide locally but never fire
       // the irreversible X mute/block with the user's session.
+      const configuredAction = settings.categoryActions[entry.category] ?? "badge";
       const action = eligible
-        ? capAutoTierAction(settings.categoryActions[entry.category] ?? "badge", {
+        ? capAutoTierAction(configuredAction, {
             source: badgeSource,
             tier: entry.tier,
             autoTierMode: settings.autoTierMode,
@@ -773,6 +1113,11 @@ export default defineContentScript({
         key,
         sig,
         action,
+        // `action !== badge` here; capAutoTierAction never turns a configured
+        // badge into a real action, so the configured value is narrowed by
+        // that invariant even though TypeScript cannot infer it.
+        requestedAction: configuredAction as RecordedAction,
+        delayedBlockEligible: action === "hide" && configuredAction === "hide",
         verb,
         anchor,
         verdict: entry.verdict,

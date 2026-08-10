@@ -13,6 +13,17 @@ import {
 } from "../../lib/settings";
 import { getStoredList, getStoredWhitelist } from "../../lib/list-sync";
 import {
+  DELAYED_BLOCK_DAILY_LIMIT,
+  DELAYED_BLOCK_HOURLY_LIMIT,
+  type DelayedBlockState,
+  type DelayedBlockStates,
+  type DelayedBlockSummary,
+  clearDelayedBlockStop,
+  getDelayedBlockMeta,
+  getDelayedBlockStates,
+  summarizeDelayedBlocks,
+} from "../../lib/delayed-block";
+import {
   type BlockRecord,
   type CacheRow,
   clearAllLocal,
@@ -77,6 +88,57 @@ const Tag = ({ label, conf }: { label: Label; conf?: number }) => {
     </span>
   );
 };
+
+const DELAYED_PAUSE_ZH: Record<string, string> = {
+  idle: "队列为空",
+  disabled: "功能已关闭",
+  not_logged_in: "等待登录 X",
+  account_mismatch: "当前 X 账号与绑定账号不一致",
+  hourly_limit: "已达到每小时上限",
+  daily_limit: "已达到 24 小时上限",
+  http_401: "X 登录态失效（401）",
+  http_403: "X 拒绝请求（403）",
+  http_429: "X 限流冷却中（429）",
+  storage_error: "本地状态异常，等待重试",
+};
+
+function DelayedBlockTag({ record, state }: { record: BlockRecord; state?: DelayedBlockState }) {
+  if (!/^\d+$/.test(record.id)) {
+    return <span className="text-[11px] text-fg-3">缺少 userId</span>;
+  }
+  if (!state) {
+    if (record.requestedAction === "mute") return <span className="text-[11px] text-fg-3">X 静音</span>;
+    if (record.requestedAction === "block") return <span className="text-[11px] text-fg-3">即时拉黑处理中</span>;
+    return <span className="text-[11px] text-fg-3">尚未建立队列</span>;
+  }
+  const map: Record<DelayedBlockState["status"], { text: string; cls: string }> = {
+    pending: { text: "待 X 拉黑", cls: "text-warn border-warn/40" },
+    processing: { text: "X 拉黑中", cls: "text-accent border-accent/40" },
+    succeeded: { text: "已 X 拉黑", cls: "text-ok border-ok/40" },
+    retry_wait: { text: "等待重试", cls: "text-warn border-warn/40" },
+    failed: { text: "X 拉黑失败", cls: "text-danger border-danger/40" },
+    skipped: {
+      text: state.skipReason === "mute" ? "不处理：静音" : "不处理：安全封顶",
+      cls: "text-fg-3 border-border-2",
+    },
+  };
+  const item = map[state.status];
+  const detail = [
+    state.lastHttpStatus ? `HTTP ${state.lastHttpStatus}` : "",
+    state.attempts ? `尝试 ${state.attempts} 次` : "",
+    state.lastError ?? "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  return (
+    <span
+      title={detail}
+      className={`inline-flex whitespace-nowrap rounded-full border px-2 py-0.5 text-[11px] ${item.cls}`}
+    >
+      {item.text}
+    </span>
+  );
+}
 
 /**
  * Themed confirm modal — replaces native window.confirm so destructive
@@ -553,8 +615,13 @@ function Overview() {
 
 function Blocklist() {
   const [list, setList] = useState<BlockRecord[]>([]);
+  const [delayedStates, setDelayedStates] = useState<DelayedBlockStates>({});
   const [q, setQ] = useState("");
-  const load = () => getBlocklist().then((l) => setList([...l].sort((a, b) => b.ts - a.ts)));
+  const load = async () => {
+    const [records, states] = await Promise.all([getBlocklist(), getDelayedBlockStates()]);
+    setList([...records].sort((a, b) => b.ts - a.ts));
+    setDelayedStates(states);
+  };
   useEffect(() => void load(), []);
   const rows = useMemo(
     () =>
@@ -589,13 +656,14 @@ function Blocklist() {
       />
       {/* overflow-x-auto（而非 hidden）：窄窗口下表格横向滚动，操作列不再被裁掉 */}
       <div className="desktop-record-table overflow-x-auto rounded-lg border border-border">
-        <table className="w-full min-w-[880px] border-collapse text-[13px]">
+        <table className="w-full min-w-[980px] border-collapse text-[13px]">
           <thead className="bg-card">
             <tr>
               <th className={th}>账号</th>
               <th className={th}>判定</th>
               <th className={th}>理由</th>
               <th className={th}>来源</th>
+              <th className={th}>X 状态</th>
               <th className={th}>时间</th>
               <th className={th} />
             </tr>
@@ -668,6 +736,9 @@ function Blocklist() {
                     {src[r.source]?.label ?? r.source}
                   </span>
                 </td>
+                <td className={td}>
+                  <DelayedBlockTag record={r} state={delayedStates[r.id]} />
+                </td>
                 <td className={`${td} font-mono text-[12px] text-fg-3`} title={whenFull(r.ts)}>
                   {when(r.ts)}
                 </td>
@@ -718,6 +789,7 @@ function Blocklist() {
             </header>
             <div className="mt-3 flex flex-wrap items-center gap-2">
               <ReasonChip raw={r.reason} />
+              <DelayedBlockTag record={r} state={delayedStates[r.id]} />
               {tweetUrl(r) && (
                 <a
                   href={tweetUrl(r) as string}
@@ -1486,11 +1558,34 @@ function Settings() {
   const [st, setSt] = useState<Settings | null>(null);
   const [ls, setLs] = useState<ListState | null>(null);
   const [permDenied, setPermDenied] = useState(false);
+  const [delayedSummary, setDelayedSummary] = useState<DelayedBlockSummary | null>(null);
+  const [delayedMsg, setDelayedMsg] = useState("");
   useEffect(() => {
     getSettings().then(setSt);
     // Loaded once so each 分级策略 row can show how many synced public-list
     // accounts fall into its category. No list yet → counts stay hidden.
     readListState().then(setLs);
+  }, []);
+  useEffect(() => {
+    let alive = true;
+    const refresh = async () => {
+      try {
+        const [records, states, meta] = await Promise.all([
+          getBlocklist(),
+          getDelayedBlockStates(),
+          getDelayedBlockMeta(),
+        ]);
+        if (alive) setDelayedSummary(summarizeDelayedBlocks(records, states, meta));
+      } catch {
+        if (alive) setDelayedSummary(null);
+      }
+    };
+    void refresh();
+    const timer = setInterval(() => void refresh(), 5_000);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
   }, []);
   const save = async <K extends keyof Settings>(k: K, v: Settings[K]) => {
     await setSetting(k, v);
@@ -1521,6 +1616,43 @@ function Settings() {
       p ? { ...p, categoryActions: { ...p.categoryActions, [cat]: action } } : p,
     );
   };
+  const changeDelayedAutoBlock = async (enabled: boolean) => {
+    setDelayedMsg("");
+    if (!enabled) {
+      await save("delayedAutoBlock", false);
+      setDelayedMsg("已暂停；队列和成功记录仍保留在本机。");
+      return;
+    }
+    const permission = await ensureXPermission();
+    if (!permission) {
+      setDelayedMsg("未授权访问 x.com，延迟拉黑仍保持关闭。");
+      return;
+    }
+    let viewer: Record<string, unknown> = {};
+    try {
+      viewer = await chrome.storage.local.get("xss:viewer");
+    } catch {
+      /* handled by the missing-viewer branch below */
+    }
+    const captured = viewer["xss:viewer"] as { handle?: string; ts?: number } | undefined;
+    const ownerHandle = String(captured?.handle ?? "").trim().replace(/^@+/, "");
+    if (!ownerHandle) {
+      setDelayedMsg("尚未识别当前 X 账号。请打开或刷新一次已登录的 x.com 页面后再开启。");
+      return;
+    }
+    try {
+      const records = await getBlocklist();
+      await save("delayedBlockOwnerHandle", ownerHandle);
+      await clearDelayedBlockStop();
+      await save("delayedAutoBlock", true);
+      const [states, meta] = await Promise.all([getDelayedBlockStates(), getDelayedBlockMeta()]);
+      setDelayedSummary(summarizeDelayedBlocks(records, states, meta));
+      setDelayedMsg(`已绑定 @${ownerHandle}；历史状态不明的数字 userId 已默认加入队列。`);
+    } catch {
+      await save("delayedAutoBlock", false);
+      setDelayedMsg("初始化本地队列失败，功能未开启。");
+    }
+  };
   return (
     <Page title="设置" sub="配置仅存于本机">
       <div className="settings-content max-w-[680px] space-y-9">
@@ -1547,6 +1679,53 @@ function Settings() {
               label="自动处理时展开面板"
               hint="关闭后仅气泡脉冲提示，不弹出处理卡片（小屏 / 手机端建议关闭）"
             />
+          </section>
+        )}
+
+        {st && (
+          <section>
+            <SectionH>延迟自动 X 拉黑</SectionH>
+            <p className="mb-3 text-[12px] leading-relaxed text-fg-3">
+              将<b className="text-fg-2">明确选择为本地隐藏</b>的账号排队，在已登录的 X 页面中低频执行原生拉黑；
+              静音账号和因「自动收录封顶」而降级的本地隐藏不会升级。历史状态不明记录默认加入。
+            </p>
+            <Toggle
+              on={st.delayedAutoBlock}
+              onChange={(v) => void changeDelayedAutoBlock(v)}
+              label="启用延迟自动 X 拉黑"
+              hint="开启时检查并在必要时申请 x.com 权限；关闭只暂停任务，不删除队列和成功记录"
+            />
+            <div className="mt-3 rounded-lg border border-border bg-card p-3 text-[12px] text-fg-2">
+              <div className="flex flex-wrap gap-x-5 gap-y-2">
+                <span>
+                  绑定账号：<b className="text-fg">{st.delayedBlockOwnerHandle ? `@${st.delayedBlockOwnerHandle}` : "未绑定"}</b>
+                </span>
+                <span>
+                  固定限速：<b className="text-fg">1～2 分钟/个 · {DELAYED_BLOCK_HOURLY_LIMIT}/小时 · {DELAYED_BLOCK_DAILY_LIMIT}/24小时</b>
+                </span>
+              </div>
+              {delayedSummary && (
+                <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+                  <span>待处理 <b className="font-mono text-fg">{delayedSummary.pending + delayedSummary.retryWait}</b></span>
+                  <span>已拉黑 <b className="font-mono text-ok">{delayedSummary.succeeded}</b></span>
+                  <span>失败 <b className="font-mono text-danger">{delayedSummary.failed}</b></span>
+                  <span>24h 请求 <b className="font-mono text-fg">{delayedSummary.dayAttempts}/{DELAYED_BLOCK_DAILY_LIMIT}</b></span>
+                </div>
+              )}
+              {delayedSummary?.pauseReason && (
+                <p className="mt-2 text-fg-3">
+                  当前状态：{DELAYED_PAUSE_ZH[delayedSummary.pauseReason] ?? delayedSummary.pauseReason}
+                  {delayedSummary.nextRunAt && delayedSummary.nextRunAt > Date.now()
+                    ? ` · 预计恢复 ${whenFull(delayedSummary.nextRunAt)}`
+                    : ""}
+                </p>
+              )}
+            </div>
+            <p className="mt-3 text-[12px] leading-relaxed text-warn">
+              X 没有公布批量拉黑的安全频率。限速只能降低突发请求，不能保证账号不受风控；X 拉黑可能解除关注关系，
+              「恢复显示」也不会自动解除 X 端拉黑。
+            </p>
+            {delayedMsg && <p className="mt-2 text-[12px] text-fg-2">{delayedMsg}</p>}
           </section>
         )}
 
@@ -1754,6 +1933,7 @@ function Settings() {
               <ul className="my-2 list-inside list-disc text-fg-3">
                 <li>本地检测缓存</li>
                 <li>你的隐藏历史 + 本地处理统计</li>
+                <li>延迟拉黑队列、成功状态和账号绑定</li>
               </ul>
               <b className="text-fg">不可恢复。</b>
             </>

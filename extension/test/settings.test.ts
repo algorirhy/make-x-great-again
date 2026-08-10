@@ -24,6 +24,8 @@ test("preserves X-native action settings across browser builds", async () => {
     assert.equal(settings.categoryActions.porn, "block");
     assert.equal(settings.categoryActions.crypto, "mute");
     assert.equal(settings.categoryActions.gambling, "badge");
+    assert.equal(settings.delayedAutoBlock, false);
+    assert.equal(settings.delayedBlockOwnerHandle, "");
   } finally {
     if (previousChrome === undefined) delete root.chrome;
     else root.chrome = previousChrome;

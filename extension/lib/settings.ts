@@ -52,6 +52,12 @@ export interface Settings {
   autoScope: AutoScope; // where auto actions may fire (replies-only by default)
   autoTierMode: AutoTierMode; // how far auto-published (non-human) list hits may auto-act
   autoExpand: boolean; // pop the bubble card open when auto-processing starts (off = pill pulse only; better on narrow/mobile viewports)
+  /** Opt-in worker that upgrades explicit local hides to X-native blocks at a
+   *  slow, capped pace while a matching logged-in X page is open. */
+  delayedAutoBlock: boolean;
+  /** Handle captured at enable-time. The worker pauses if the live X viewer
+   *  differs, preventing one browser profile's queue from crossing accounts. */
+  delayedBlockOwnerHandle: string;
   edgeBase: string; // advanced: override the service base URL — list/whitelist sync source, whitelist-apply backend AND outbound links
 }
 
@@ -76,6 +82,8 @@ export const DEFAULTS: Settings = {
   autoScope: "replies",
   autoTierMode: "full",
   autoExpand: true,
+  delayedAutoBlock: false,
+  delayedBlockOwnerHandle: "",
   edgeBase: "",
 };
 

@@ -18,6 +18,8 @@ export interface XActionAttempt {
   status?: number;
   retryable?: boolean;
   retryAfterMs?: number;
+  /** Cancelled before/while sending because the owning delayed runner stopped. */
+  aborted?: boolean;
 }
 
 // X web's long-standing public bearer (same one the site itself sends).
@@ -54,7 +56,22 @@ type LockCapableNavigator = Navigator & {
   };
 };
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(done, ms);
+    function done() {
+      signal?.removeEventListener("abort", aborted);
+      resolve();
+    }
+    function aborted() {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", aborted);
+      reject(new DOMException("Aborted", "AbortError"));
+    }
+    signal?.addEventListener("abort", aborted, { once: true });
+  });
+}
 
 function ct0() {
   return document.cookie.match(/ct0=([^;]+)/)?.[1] ?? "";
@@ -157,20 +174,22 @@ function recordSuccess() {
   });
 }
 
-async function waitForSlot() {
+async function waitForSlot(signal?: AbortSignal) {
   while (true) {
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
     const round = readRound();
     const cooldownRemaining = round.cooldownUntil - Date.now();
     if (cooldownRemaining > 0) {
-      await sleep(Math.min(1000, cooldownRemaining));
+      await sleep(Math.min(1000, cooldownRemaining), signal);
       continue;
     }
     const lastAt = storageNumber(LS_LAST_ACTION);
     const jitter = Math.floor(Math.random() * ACTION_JITTER_MS);
     const remaining = lastAt + ACTION_DELAY_MS + jitter - Date.now();
     if (remaining <= 0) break;
-    await sleep(Math.min(1000, remaining));
+    await sleep(Math.min(1000, remaining), signal);
   }
+  if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
   setStorageNumber(LS_LAST_ACTION, Date.now());
 }
 
@@ -184,8 +203,10 @@ async function rawAction(
   kind: XActionKind,
   userId?: string,
   handle?: string,
+  signal?: AbortSignal,
 ): Promise<XActionAttempt> {
   try {
+    if (signal?.aborted) return { ok: false, retryable: false, aborted: true };
     const csrf = ct0();
     if (!csrf) return { ok: false, retryable: false };
     const screenName = normalizeHandle(handle);
@@ -196,6 +217,8 @@ async function rawAction(
     else if (screenName) body.set("screen_name", screenName);
     else return { ok: false, retryable: false };
     const controller = new AbortController();
+    const abortFromOwner = () => controller.abort();
+    signal?.addEventListener("abort", abortFromOwner, { once: true });
     const timer = setTimeout(() => controller.abort(), 15_000);
     const res = await fetch(`${apiOrigin()}${ENDPOINT[kind]}`, {
       method: "POST",
@@ -209,7 +232,10 @@ async function rawAction(
         "content-type": "application/x-www-form-urlencoded",
       },
       body: body.toString(),
-    }).finally(() => clearTimeout(timer));
+    }).finally(() => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abortFromOwner);
+    });
     const status = res.status;
     return {
       ok: res.ok,
@@ -219,6 +245,7 @@ async function rawAction(
         status === 408 || status === 425 || status === 429 || status >= 500,
     };
   } catch {
+    if (signal?.aborted) return { ok: false, retryable: false, aborted: true };
     return { ok: false, retryable: true };
   }
 }
@@ -228,10 +255,30 @@ export async function performXAction(
   kind: XActionKind,
   userId?: string,
   handle?: string,
+  options?: {
+    signal?: AbortSignal;
+    /** Final safety gate, evaluated inside the global X-action lock after all
+     *  pacing waits and immediately before the POST. */
+    shouldProceed?: () => boolean | Promise<boolean>;
+  },
 ): Promise<XActionAttempt> {
   return withLock(async () => {
-    await waitForSlot();
-    const attempt = await rawAction(kind, userId, handle);
+    try {
+      await waitForSlot(options?.signal);
+    } catch (error) {
+      if ((error as { name?: string })?.name === "AbortError") {
+        return { ok: false, retryable: false, aborted: true };
+      }
+      throw error;
+    }
+    if (options?.signal?.aborted) {
+      return { ok: false, retryable: false, aborted: true };
+    }
+    if (options?.shouldProceed && !(await options.shouldProceed())) {
+      return { ok: false, retryable: false, aborted: true };
+    }
+    const attempt = await rawAction(kind, userId, handle, options?.signal);
+    if (attempt.aborted) return attempt;
     if (attempt.ok) recordSuccess();
     else recordFailure(attempt);
     return attempt;

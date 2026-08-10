@@ -11,6 +11,13 @@ import type { Verdict } from "./types";
 // (Legacy sources from the auto-block era are kept for old stored records.)
 export type BlockSource = "manual" | "auto" | "block_all" | "list_hit" | "cache_hit";
 
+/** Structured action audit for records written by v0.5.1+.
+ *
+ * Old rows intentionally leave these fields absent: their original action
+ * cannot be reconstructed reliably, so delayed-block migration applies the
+ * documented legacy policy instead of pretending the data is precise. */
+export type RecordedAction = "hide" | "mute" | "block";
+
 export interface BlockRecord {
   id: string; // userId, or h:<handle> fallback
   handle: string;
@@ -25,6 +32,14 @@ export interface BlockRecord {
   tweetId?: string;
   /** Snapshot of the triggering text — survives tweet deletion. */
   tweetText?: string;
+  /** What the user/category policy requested before safety caps. */
+  requestedAction?: RecordedAction;
+  /** What actually ran after tier/scope safety caps. */
+  effectiveAction?: RecordedAction;
+  /** True only for an explicit local hide. A mute/block degraded to hide by
+   *  autoTierMode="hide" must stay false so delayed blocking cannot bypass
+   *  the project's irreversible-action safety boundary. */
+  delayedBlockEligible?: boolean;
   source: BlockSource;
   ts: number;
 }
