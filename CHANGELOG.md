@@ -32,6 +32,9 @@ otherwise.
   the request. Existing zero-attempt legacy success markers are requeued once.
 - Per-record delayed status pills keep handle fallback details in their tooltip
   instead of displaying the implementation detail in the visible label.
+- HTTP 404 block responses are classified as unavailable targets instead of
+  failures. They are not retried or redirected through handle fallback, and
+  existing 404 states migrate automatically.
 - Consolidated the macOS and iOS containers and Safari extensions into one Xcode project with
   four platform-specific targets; deployment baselines are now macOS 15 and iOS 18.
 - Safari's in-page blacklist index now retains compact lite rows and expands display data only

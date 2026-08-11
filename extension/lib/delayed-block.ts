@@ -30,7 +30,11 @@ export type DelayedBlockStatus =
 
 export type DelayedBlockOrigin = "local_hide" | "direct_block_retry" | "legacy";
 
-export type DelayedBlockSkipReason = "mute" | "policy_cap" | "superseded";
+export type DelayedBlockSkipReason =
+  | "mute"
+  | "policy_cap"
+  | "superseded"
+  | "target_unavailable";
 
 export type DelayedBlockPauseReason =
   | "idle"
@@ -82,6 +86,7 @@ export interface DelayedBlockSummary {
   retryWait: number;
   failed: number;
   skipped: number;
+  unavailable: number;
   handleOnly: number;
   invalidTarget: number;
   hourAttempts: number;
@@ -337,6 +342,36 @@ function requeueUnverifiedLegacySuccess(
   return next;
 }
 
+function needsTargetUnavailableMigration(state: DelayedBlockState | undefined): boolean {
+  return (
+    state?.lastHttpStatus === 404 &&
+    (state.status === "pending" ||
+      state.status === "processing" ||
+      state.status === "retry_wait" ||
+      state.status === "failed")
+  );
+}
+
+export function isTargetUnavailableDelayedBlockState(
+  state: DelayedBlockState | undefined,
+): boolean {
+  return state?.skipReason === "target_unavailable" || needsTargetUnavailableMigration(state);
+}
+
+function targetUnavailableState(state: DelayedBlockState, now: number): DelayedBlockState {
+  const next: DelayedBlockState = {
+    ...state,
+    status: "skipped",
+    skipReason: "target_unavailable",
+    updatedAt: now,
+    lastHttpStatus: 404,
+  };
+  delete next.blockedAt;
+  delete next.nextRetryAt;
+  delete next.lastError;
+  return next;
+}
+
 interface RecordTarget {
   record: BlockRecord;
   target: DelayedBlockTarget;
@@ -375,6 +410,7 @@ export async function ensureDelayedStatesForRecords(
     const fallback = handleFallbackKey(target) ? existing[handleFallbackKey(target)!] : undefined;
     return (
       !current ||
+      needsTargetUnavailableMigration(current) ||
       isUnverifiedLegacySuccess(current) ||
       (!!fallback && fallback.skipReason !== "superseded") ||
       (fallback?.status === "succeeded" &&
@@ -388,7 +424,10 @@ export async function ensureDelayedStatesForRecords(
       const fallbackKey = handleFallbackKey(target);
       const fallback = fallbackKey ? states[fallbackKey] : undefined;
       let current = states[target.key];
-      if (isUnverifiedLegacySuccess(current) && current) {
+      if (needsTargetUnavailableMigration(current) && current) {
+        current = targetUnavailableState(current, now);
+        states[target.key] = current;
+      } else if (isUnverifiedLegacySuccess(current) && current) {
         current = requeueUnverifiedLegacySuccess(current, now);
         states[target.key] = current;
       }
@@ -443,7 +482,13 @@ export async function enqueueDelayedBlock(
   if (!target) return;
   await mutateStates((states) => {
     const current = states[target.key];
-    if (current?.status === "succeeded" || current?.status === "processing") return;
+    if (
+      current?.status === "succeeded" ||
+      current?.status === "processing" ||
+      isTargetUnavailableDelayedBlockState(current)
+    ) {
+      return;
+    }
     states[target.key] = {
       ...(current ?? pendingState(target, origin, now)),
       targetKey: target.key,
@@ -487,6 +532,20 @@ export async function recordDirectBlockResult(
         lastError: undefined,
         skipReason: undefined,
       };
+      return;
+    }
+    if (attempt.status === 404) {
+      states[target.key] = targetUnavailableState(
+        {
+          ...current,
+          targetKey: target.key,
+          ...(target.userId ? { userId: target.userId } : {}),
+          handle: target.handle,
+          origin: "direct_block_retry",
+          lastHttpStatus: 404,
+        },
+        now,
+      );
       return;
     }
     states[target.key] = {
@@ -576,6 +635,12 @@ export async function settleDelayedBlockAttempt(
       state.nextRetryAt = undefined;
       state.lastError = undefined;
       return { state: { ...state } };
+    }
+
+    if (attempt.status === 404) {
+      const unavailable = targetUnavailableState(state, now);
+      states[targetKey] = unavailable;
+      return { state: { ...unavailable } };
     }
 
     state.lastError = attempt.status ? `HTTP ${attempt.status}` : "network_error";
@@ -729,6 +794,7 @@ export function summarizeDelayedBlocks(
     retryWait: 0,
     failed: 0,
     skipped: 0,
+    unavailable: 0,
     handleOnly: targets.filter((target) => target && !target.userId).length,
     invalidTarget: targets.filter((target) => !target).length,
     hourAttempts: 0,
@@ -738,6 +804,11 @@ export function summarizeDelayedBlocks(
   };
   for (const state of Object.values(states)) {
     if (!activeIds.has(state.targetKey)) continue;
+    if (isTargetUnavailableDelayedBlockState(state)) {
+      summary.skipped += 1;
+      summary.unavailable += 1;
+      continue;
+    }
     if (state.status === "pending") summary.pending += 1;
     else if (state.status === "processing") summary.processing += 1;
     else if (state.status === "succeeded") summary.succeeded += 1;

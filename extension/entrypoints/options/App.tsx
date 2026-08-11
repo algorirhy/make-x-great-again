@@ -23,6 +23,7 @@ import {
   ensureDelayedStatesForRecords,
   getDelayedBlockMeta,
   getDelayedBlockStates,
+  isTargetUnavailableDelayedBlockState,
   summarizeDelayedBlocks,
 } from "../../lib/delayed-block";
 import {
@@ -132,6 +133,9 @@ function DelayedBlockTag({ record, state }: { record: BlockRecord; state?: Delay
     },
   };
   const item = map[state.status];
+  const displayedItem = isTargetUnavailableDelayedBlockState(state)
+    ? { text: "目标不存在/不可用", cls: "text-fg-3 border-border-2" }
+    : item;
   const detail = [
     viaHandle ? `按当前 @${target.handle} 执行` : "",
     state.lastHttpStatus ? `HTTP ${state.lastHttpStatus}` : "",
@@ -143,9 +147,9 @@ function DelayedBlockTag({ record, state }: { record: BlockRecord; state?: Delay
   return (
     <span
       title={detail}
-      className={`inline-flex whitespace-nowrap rounded-full border px-2 py-0.5 text-[11px] ${item.cls}`}
+      className={`inline-flex whitespace-nowrap rounded-full border px-2 py-0.5 text-[11px] ${displayedItem.cls}`}
     >
-      {item.text}
+      {displayedItem.text}
     </span>
   );
 }
@@ -1724,10 +1728,11 @@ function Settings() {
                 </span>
               </div>
               {delayedSummary && (
-                <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-5">
+                <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-6">
                   <span>待处理 <b className="font-mono text-fg">{delayedSummary.pending + delayedSummary.retryWait}</b></span>
                   <span>已拉黑 <b className="font-mono text-ok">{delayedSummary.succeeded}</b></span>
                   <span>失败 <b className="font-mono text-danger">{delayedSummary.failed}</b></span>
+                  <span>目标不可用 <b className="font-mono text-fg-3">{delayedSummary.unavailable}</b></span>
                   <span>handle 兜底 <b className="font-mono text-fg">{delayedSummary.handleOnly}</b></span>
                   <span>24h 请求 <b className="font-mono text-fg">{delayedSummary.dayAttempts}/{DELAYED_BLOCK_DAILY_LIMIT}</b></span>
                 </div>

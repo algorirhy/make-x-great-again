@@ -7,6 +7,7 @@ import {
   DELAYED_BLOCK_INTERVAL_MIN_MS,
   delayedBlockTarget,
   delayedBlockRateDecision,
+  enqueueDelayedBlock,
   ensureDelayedStatesForRecords,
   getDelayedBlockStates,
   initialDelayedStateForRecord,
@@ -16,6 +17,7 @@ import {
   recordDirectBlockResult,
   selectNextDelayedBlock,
   settleDelayedBlockAttempt,
+  summarizeDelayedBlocks,
   type DelayedBlockState,
   type DelayedBlockStates,
 } from "../lib/delayed-block";
@@ -139,6 +141,25 @@ test("candidate selection includes handle-only rows", () => {
   assert.equal(selectNextDelayedBlock(records, states, NOW)?.userId, undefined);
 });
 
+test("stored 404 failures are presented as unavailable before migration persists", () => {
+  const summary = summarizeDelayedBlocks(
+    [record()],
+    {
+      "123": state({
+        status: "failed",
+        attempts: 1,
+        lastHttpStatus: 404,
+        lastError: "HTTP 404",
+      }),
+    },
+    { attemptTimestamps: [] },
+    NOW,
+  );
+  assert.equal(summary.unavailable, 1);
+  assert.equal(summary.failed, 0);
+  assert.equal(summary.skipped, 1);
+});
+
 test("rolling hour/day request caps count attempts, not successes", () => {
   assert.equal(DELAYED_BLOCK_HOURLY_LIMIT, 60);
   assert.equal(DELAYED_BLOCK_DAILY_LIMIT, 360);
@@ -225,6 +246,17 @@ test("persistent state transitions dedupe success and stop on auth/rate errors",
         createdAt: NOW - 20_000,
         updatedAt: NOW - 20_000,
       },
+      "775": {
+        userId: "775",
+        handle: "missing",
+        status: "failed",
+        origin: "legacy",
+        attempts: 1,
+        lastHttpStatus: 404,
+        lastError: "HTTP 404",
+        createdAt: NOW - 20_000,
+        updatedAt: NOW - 20_000,
+      },
     };
     const migratedV1 = await getDelayedBlockStates();
     assert.equal(migratedV1["777"]?.targetKey, "777");
@@ -233,12 +265,16 @@ test("persistent state transitions dedupe success and stop on auth/rate errors",
     await ensureDelayedStatesForRecords([
       record({ requestedAction: "hide", effectiveAction: "hide", delayedBlockEligible: true }),
       record({ id: "776", handle: "unverified", reason: "色情 · 自动拉黑" }),
+      record({ id: "775", handle: "missing", reason: "色情 · 自动隐藏" }),
     ], NOW);
     const initialized = await getDelayedBlockStates();
     assert.equal(initialized["123"]?.status, "pending");
     assert.equal(initialized["776"]?.status, "pending");
     assert.equal(initialized["776"]?.blockedAt, undefined);
     assert.equal(initialized["777"]?.status, "succeeded");
+    assert.equal(initialized["775"]?.status, "skipped");
+    assert.equal(initialized["775"]?.skipReason, "target_unavailable");
+    assert.equal(initialized["775"]?.lastError, undefined);
 
     await markDelayedBlockProcessing("123", NOW + 1);
     const auth = await settleDelayedBlockAttempt(
@@ -294,6 +330,58 @@ test("persistent state transitions dedupe success and stop on auth/rate errors",
     assert.equal(mutedUpgrade["998"]?.status, "skipped");
     assert.equal(mutedUpgrade["998"]?.skipReason, "mute");
 
+    // HTTP 404 means X cannot act on the target. It is a terminal,
+    // non-failure outcome and repeated local hits must not requeue it.
+    await recordDirectBlockResult(
+      undefined,
+      "GoneUser",
+      { ok: false, status: 404, retryable: false },
+      NOW + 9,
+    );
+    let unavailableStates = await getDelayedBlockStates();
+    assert.equal(unavailableStates["h:goneuser"]?.status, "skipped");
+    assert.equal(unavailableStates["h:goneuser"]?.skipReason, "target_unavailable");
+    assert.equal(
+      selectNextDelayedBlock(
+        [record({ id: "h:GoneUser", handle: "GoneUser" })],
+        unavailableStates,
+        NOW + 10,
+      ),
+      null,
+    );
+
+    await enqueueDelayedBlock(undefined, "GoneUser", "local_hide", NOW + 11);
+    unavailableStates = await getDelayedBlockStates();
+    assert.equal(unavailableStates["h:goneuser"]?.skipReason, "target_unavailable");
+
+    await ensureDelayedStatesForRecords([
+      record({
+        id: "457",
+        handle: "deleted",
+        requestedAction: "hide",
+        effectiveAction: "hide",
+        delayedBlockEligible: true,
+      }),
+    ], NOW + 12);
+    await markDelayedBlockProcessing("457", NOW + 13);
+    const unavailable = await settleDelayedBlockAttempt(
+      "457",
+      { ok: false, status: 404, retryable: false },
+      NOW + 14,
+    );
+    assert.equal(unavailable?.state.status, "skipped");
+    assert.equal(unavailable?.state.skipReason, "target_unavailable");
+    assert.equal(unavailable?.state.attempts, 1);
+    assert.equal((await getDelayedBlockStates())["h:deleted"], undefined);
+    const unavailableSummary = summarizeDelayedBlocks(
+      [record({ id: "457", handle: "deleted" })],
+      await getDelayedBlockStates(),
+      { attemptTimestamps: [] },
+      NOW + 15,
+    );
+    assert.equal(unavailableSummary.unavailable, 1);
+    assert.equal(unavailableSummary.failed, 0);
+
     // Use a fresh target for 429 so the success ledger is never downgraded.
     await ensureDelayedStatesForRecords([
       record({
@@ -303,22 +391,22 @@ test("persistent state transitions dedupe success and stop on auth/rate errors",
         effectiveAction: "hide",
         delayedBlockEligible: true,
       }),
-    ], NOW + 9);
-    await markDelayedBlockProcessing("456", NOW + 10);
+    ], NOW + 16);
+    await markDelayedBlockProcessing("456", NOW + 17);
     const rate = await settleDelayedBlockAttempt(
       "456",
       { ok: false, status: 429, retryable: true, retryAfterMs: 1_000 },
-      NOW + 11,
+      NOW + 18,
     );
     assert.equal(rate?.stop?.reason, "http_429");
-    assert.equal(rate?.stop?.until, NOW + 11 + 60 * 60_000);
+    assert.equal(rate?.stop?.until, NOW + 18 + 60 * 60_000);
 
     memory["xss:delayed-block:meta:v1"] = {
       attemptTimestamps: [],
       pauseReason: "http_429",
       pausedUntil: NOW + 60 * 60_000,
     };
-    assert.equal(await recordDelayedBlockAttempt(NOW + 12), null);
+    assert.equal(await recordDelayedBlockAttempt(NOW + 19), null);
   } finally {
     if (previousChrome === undefined) delete root.chrome;
     else root.chrome = previousChrome;
