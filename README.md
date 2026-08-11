@@ -92,7 +92,7 @@ X 现在的问题，大家都知道：
 ### 个人 fork 增强：延迟自动 X 拉黑
 
 > [!IMPORTANT]
-> 本功能只存在于 `codex/delayed-auto-block` 个人开发分支，不属于上游项目当前的
+> 本功能只存在于 `delayed-auto-block` 个人开发分支，不属于上游项目当前的
 > Chrome Web Store、Firefox 或 Safari 发行版。
 
 这个增强同时解决两个问题：把过去已经本地隐藏、但在手机端仍可见的账号逐步升级为
