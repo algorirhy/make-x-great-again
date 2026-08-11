@@ -13,8 +13,10 @@ otherwise.
 - Opt-in delayed X blocking for explicit local-hide records in the personal
   Chrome build: persistent success dedupe, viewer-handle binding, cross-tab
   serialization, 1–2 minute pacing, rolling 30/hour and 200/day request caps,
-  and hard stops on 401/403/429. Known mutes and safety-capped auto-tier hides
-  are excluded; ambiguous numeric-id legacy rows are included by design.
+  and hard stops on 401/403/429. Numeric user IDs are preferred, with a
+  validated handle fallback for records where X did not expose the ID. Known
+  mutes and safety-capped auto-tier hides are excluded; ambiguous legacy rows
+  are included by design.
 - iOS / iPadOS 18+ Safari Web Extension container with a SwiftUI setup guide,
   Simulator build script, shared MV3 resources, and iPhone/iPad icons.
 - Touch-first badge popovers plus an iOS hamburger drawer, single-column dashboard cards,

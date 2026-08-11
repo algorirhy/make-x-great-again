@@ -19,6 +19,7 @@ import {
   type DelayedBlockStates,
   type DelayedBlockSummary,
   clearDelayedBlockStop,
+  delayedBlockTargetForRecord,
   getDelayedBlockMeta,
   getDelayedBlockStates,
   summarizeDelayedBlocks,
@@ -103,27 +104,35 @@ const DELAYED_PAUSE_ZH: Record<string, string> = {
 };
 
 function DelayedBlockTag({ record, state }: { record: BlockRecord; state?: DelayedBlockState }) {
-  if (!/^\d+$/.test(record.id)) {
-    return <span className="text-[11px] text-fg-3">缺少 userId</span>;
+  const target = delayedBlockTargetForRecord(record);
+  if (!target) {
+    return <span className="text-[11px] text-danger">handle 无效，无法处理</span>;
   }
+  const viaHandle = !target.userId;
   if (!state) {
     if (record.requestedAction === "mute") return <span className="text-[11px] text-fg-3">X 静音</span>;
     if (record.requestedAction === "block") return <span className="text-[11px] text-fg-3">即时拉黑处理中</span>;
-    return <span className="text-[11px] text-fg-3">尚未建立队列</span>;
+    return <span className="text-[11px] text-fg-3">{viaHandle ? "仅有 handle · 尚未入队" : "尚未建立队列"}</span>;
   }
   const map: Record<DelayedBlockState["status"], { text: string; cls: string }> = {
-    pending: { text: "待 X 拉黑", cls: "text-warn border-warn/40" },
-    processing: { text: "X 拉黑中", cls: "text-accent border-accent/40" },
+    pending: { text: viaHandle ? "待 X 拉黑 · handle" : "待 X 拉黑", cls: "text-warn border-warn/40" },
+    processing: { text: viaHandle ? "X 拉黑中 · handle" : "X 拉黑中", cls: "text-accent border-accent/40" },
     succeeded: { text: "已 X 拉黑", cls: "text-ok border-ok/40" },
     retry_wait: { text: "等待重试", cls: "text-warn border-warn/40" },
     failed: { text: "X 拉黑失败", cls: "text-danger border-danger/40" },
     skipped: {
-      text: state.skipReason === "mute" ? "不处理：静音" : "不处理：安全封顶",
+      text:
+        state.skipReason === "mute"
+          ? "不处理：静音"
+          : state.skipReason === "superseded"
+            ? "已改用数字 ID"
+            : "不处理：安全封顶",
       cls: "text-fg-3 border-border-2",
     },
   };
   const item = map[state.status];
   const detail = [
+    viaHandle ? `按当前 @${target.handle} 执行` : "",
     state.lastHttpStatus ? `HTTP ${state.lastHttpStatus}` : "",
     state.attempts ? `尝试 ${state.attempts} 次` : "",
     state.lastError ?? "",
@@ -737,7 +746,10 @@ function Blocklist() {
                   </span>
                 </td>
                 <td className={td}>
-                  <DelayedBlockTag record={r} state={delayedStates[r.id]} />
+                  <DelayedBlockTag
+                    record={r}
+                    state={delayedStates[delayedBlockTargetForRecord(r)?.key ?? ""]}
+                  />
                 </td>
                 <td className={`${td} font-mono text-[12px] text-fg-3`} title={whenFull(r.ts)}>
                   {when(r.ts)}
@@ -789,7 +801,10 @@ function Blocklist() {
             </header>
             <div className="mt-3 flex flex-wrap items-center gap-2">
               <ReasonChip raw={r.reason} />
-              <DelayedBlockTag record={r} state={delayedStates[r.id]} />
+              <DelayedBlockTag
+                record={r}
+                state={delayedStates[delayedBlockTargetForRecord(r)?.key ?? ""]}
+              />
               {tweetUrl(r) && (
                 <a
                   href={tweetUrl(r) as string}
@@ -1647,7 +1662,7 @@ function Settings() {
       await save("delayedAutoBlock", true);
       const [states, meta] = await Promise.all([getDelayedBlockStates(), getDelayedBlockMeta()]);
       setDelayedSummary(summarizeDelayedBlocks(records, states, meta));
-      setDelayedMsg(`已绑定 @${ownerHandle}；历史状态不明的数字 userId 已默认加入队列。`);
+      setDelayedMsg(`已绑定 @${ownerHandle}；历史状态不明记录已按“数字 ID 优先、handle 兜底”加入队列。`);
     } catch {
       await save("delayedAutoBlock", false);
       setDelayedMsg("初始化本地队列失败，功能未开启。");
@@ -1705,10 +1720,11 @@ function Settings() {
                 </span>
               </div>
               {delayedSummary && (
-                <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+                <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-5">
                   <span>待处理 <b className="font-mono text-fg">{delayedSummary.pending + delayedSummary.retryWait}</b></span>
                   <span>已拉黑 <b className="font-mono text-ok">{delayedSummary.succeeded}</b></span>
                   <span>失败 <b className="font-mono text-danger">{delayedSummary.failed}</b></span>
+                  <span>handle 兜底 <b className="font-mono text-fg">{delayedSummary.handleOnly}</b></span>
                   <span>24h 请求 <b className="font-mono text-fg">{delayedSummary.dayAttempts}/{DELAYED_BLOCK_DAILY_LIMIT}</b></span>
                 </div>
               )}

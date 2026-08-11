@@ -5,6 +5,7 @@ import { BRAND } from "../lib/brand";
 import { type Cached, cacheGet, signalsHash } from "../lib/cache";
 import {
   clearDelayedBlockStop,
+  delayedBlockTargetForRecord,
   delayedBlockRateDecision,
   enqueueDelayedBlock,
   ensureDelayedStatesForRecords,
@@ -496,7 +497,9 @@ export default defineContentScript({
             const latestSettings = await getSettings();
             const latestRecords = await getBlocklist();
             const latestMeta = await getDelayedBlockMeta();
-            const stillPresent = latestRecords.some((record) => record.id === next.userId);
+            const stillPresent = latestRecords.some(
+              (record) => delayedBlockTargetForRecord(record)?.key === next.targetKey,
+            );
             const latestViewer = viewerHandle()?.toLowerCase();
             const latestRate = delayedBlockRateDecision(latestMeta.attemptTimestamps, Date.now());
             const hardStopped =
@@ -523,7 +526,7 @@ export default defineContentScript({
               await abortableSleep(1_000, signal);
               continue;
             }
-            const processing = await markDelayedBlockProcessing(next.userId, Date.now());
+            const processing = await markDelayedBlockProcessing(next.targetKey, Date.now());
             if (!processing) continue;
             const { performXAction } = await import("../lib/x-action");
             const attempt = await performXAction("block", next.userId, next.handle, {
@@ -544,7 +547,9 @@ export default defineContentScript({
                   finalSettings.enabled &&
                   finalSettings.delayedAutoBlock &&
                   finalViewer === owner &&
-                  finalRecords.some((record) => record.id === next.userId) &&
+                  finalRecords.some(
+                    (record) => delayedBlockTargetForRecord(record)?.key === next.targetKey,
+                  ) &&
                   !finalHardStop
                 );
               },
@@ -553,7 +558,7 @@ export default defineContentScript({
               await recoverProcessingDelayedBlocks().catch(() => {});
               return;
             }
-            const settled = await settleDelayedBlockAttempt(next.userId, attempt, Date.now());
+            const settled = await settleDelayedBlockAttempt(next.targetKey, attempt, Date.now());
             const after = Date.now();
             if (settled?.stop) {
               await updateDelayedBlockMeta({

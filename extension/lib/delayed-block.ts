@@ -15,7 +15,8 @@ export const DELAYED_BLOCK_INTERVAL_MAX_MS = 120_000;
 export const DELAYED_BLOCK_HOURLY_LIMIT = 30;
 export const DELAYED_BLOCK_DAILY_LIMIT = 200;
 
-const K_STATES = "xss:delayed-block:states:v1";
+const K_STATES = "xss:delayed-block:states:v2";
+const K_STATES_V1 = "xss:delayed-block:states:v1";
 const K_META = "xss:delayed-block:meta:v1";
 const STORAGE_LOCK = "mxga-delayed-block-storage";
 
@@ -29,7 +30,7 @@ export type DelayedBlockStatus =
 
 export type DelayedBlockOrigin = "local_hide" | "direct_block_retry" | "legacy";
 
-export type DelayedBlockSkipReason = "mute" | "policy_cap";
+export type DelayedBlockSkipReason = "mute" | "policy_cap" | "superseded";
 
 export type DelayedBlockPauseReason =
   | "idle"
@@ -44,7 +45,10 @@ export type DelayedBlockPauseReason =
   | "storage_error";
 
 export interface DelayedBlockState {
-  userId: string;
+  /** Canonical queue key: immutable numeric userId, or h:<lowercase handle>. */
+  targetKey: string;
+  /** Preferred immutable identity. Absent only when the action must use screen_name. */
+  userId?: string;
   handle: string;
   status: DelayedBlockStatus;
   origin: DelayedBlockOrigin;
@@ -78,7 +82,8 @@ export interface DelayedBlockSummary {
   retryWait: number;
   failed: number;
   skipped: number;
-  missingUserId: number;
+  handleOnly: number;
+  invalidTarget: number;
   hourAttempts: number;
   dayAttempts: number;
   nextRunAt?: number;
@@ -128,11 +133,73 @@ export function isNumericUserId(id: string | undefined): id is string {
   return !!id && /^\d+$/.test(id);
 }
 
+export function normalizeDelayedBlockHandle(handle: string | undefined): string | undefined {
+  const normalized = handle?.trim().replace(/^@+/, "").toLowerCase();
+  return normalized && /^[a-z0-9_]{1,15}$/.test(normalized) ? normalized : undefined;
+}
+
+export interface DelayedBlockTarget {
+  key: string;
+  handle: string;
+  userId?: string;
+}
+
+/** Prefer X's immutable numeric id; fall back to its validated screen_name. */
+export function delayedBlockTarget(
+  userId: string | undefined,
+  handle: string | undefined,
+): DelayedBlockTarget | null {
+  const normalizedHandle = normalizeDelayedBlockHandle(handle);
+  if (isNumericUserId(userId)) {
+    return {
+      key: userId,
+      userId,
+      handle: normalizedHandle ?? handle?.trim().replace(/^@+/, "") ?? "",
+    };
+  }
+  return normalizedHandle
+    ? { key: `h:${normalizedHandle}`, handle: normalizedHandle }
+    : null;
+}
+
+export function delayedBlockTargetForRecord(record: BlockRecord): DelayedBlockTarget | null {
+  const fallbackHandle = record.id.startsWith("h:") ? record.id.slice(2) : undefined;
+  return delayedBlockTarget(
+    isNumericUserId(record.id) ? record.id : undefined,
+    normalizeDelayedBlockHandle(record.handle) ? record.handle : fallbackHandle,
+  );
+}
+
+function normalizeStoredStates(raw: unknown): DelayedBlockStates {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const normalized: DelayedBlockStates = {};
+  for (const [storedKey, value] of Object.entries(raw)) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    const state = value as Partial<DelayedBlockState> & { userId?: string };
+    const legacyTarget = state.targetKey ?? state.userId ?? storedKey;
+    const target = delayedBlockTarget(
+      isNumericUserId(legacyTarget) ? legacyTarget : state.userId,
+      state.handle ?? (legacyTarget.startsWith("h:") ? legacyTarget.slice(2) : undefined),
+    );
+    if (!target || typeof state.status !== "string" || typeof state.origin !== "string") continue;
+    const next = {
+      ...state,
+      targetKey: target.key,
+      handle: target.handle,
+      ...(target.userId ? { userId: target.userId } : {}),
+    } as DelayedBlockState;
+    if (!target.userId) delete next.userId;
+    normalized[target.key] = next;
+  }
+  return normalized;
+}
+
 export async function getDelayedBlockStates(): Promise<DelayedBlockStates> {
-  const raw = await getLocal<unknown>(K_STATES, {});
-  return raw && typeof raw === "object" && !Array.isArray(raw)
-    ? (raw as DelayedBlockStates)
-    : {};
+  const current = await getLocal<unknown | undefined>(K_STATES, undefined);
+  if (current !== undefined) return normalizeStoredStates(current);
+  // v1 stored numeric-only states with `userId` as both identity and map key.
+  // Read it until the next mutation persists the normalized v2 schema.
+  return normalizeStoredStates(await getLocal<unknown>(K_STATES_V1, {}));
 }
 
 export async function getDelayedBlockMeta(): Promise<DelayedBlockMeta> {
@@ -166,14 +233,14 @@ async function mutateMeta<T>(mutate: (meta: DelayedBlockMeta) => T | Promise<T>)
 }
 
 function pendingState(
-  userId: string,
-  handle: string,
+  target: DelayedBlockTarget,
   origin: DelayedBlockOrigin,
   now: number,
 ): DelayedBlockState {
   return {
-    userId,
-    handle,
+    targetKey: target.key,
+    ...(target.userId ? { userId: target.userId } : {}),
+    handle: target.handle,
     status: "pending",
     origin,
     attempts: 0,
@@ -183,15 +250,15 @@ function pendingState(
 }
 
 function skippedState(
-  userId: string,
-  handle: string,
+  target: DelayedBlockTarget,
   origin: DelayedBlockOrigin,
   skipReason: DelayedBlockSkipReason,
   now: number,
 ): DelayedBlockState {
   return {
-    userId,
-    handle,
+    targetKey: target.key,
+    ...(target.userId ? { userId: target.userId } : {}),
+    handle: target.handle,
     status: "skipped",
     origin,
     skipReason,
@@ -212,42 +279,69 @@ export function initialDelayedStateForRecord(
   record: BlockRecord,
   now = Date.now(),
 ): DelayedBlockState | null {
-  if (!isNumericUserId(record.id)) return null;
+  const target = delayedBlockTargetForRecord(record);
+  if (!target) return null;
 
   if (record.requestedAction) {
     if (record.requestedAction === "mute") {
-      return skippedState(record.id, record.handle, "local_hide", "mute", now);
+      return skippedState(target, "local_hide", "mute", now);
     }
     if (record.requestedAction === "hide") {
       return record.delayedBlockEligible
-        ? pendingState(record.id, record.handle, "local_hide", now)
-        : skippedState(record.id, record.handle, "local_hide", "policy_cap", now);
+        ? pendingState(target, "local_hide", now)
+        : skippedState(target, "local_hide", "policy_cap", now);
     }
     if (record.effectiveAction === "hide" && !record.delayedBlockEligible) {
-      return skippedState(record.id, record.handle, "local_hide", "policy_cap", now);
+      return skippedState(target, "local_hide", "policy_cap", now);
     }
     // A structured direct block is normally settled by
     // recordDirectBlockResult(). The reason fallback only covers a storage
     // write that failed after the foreground path had already annotated the
     // audit row as unsuccessful.
     return /失败|仅本地隐藏/.test(record.reason ?? "")
-      ? pendingState(record.id, record.handle, "direct_block_retry", now)
+      ? pendingState(target, "direct_block_retry", now)
       : null;
   }
 
   const reason = record.reason ?? "";
   const failed = /失败|仅本地隐藏/.test(reason);
   if (/静音/.test(reason)) {
-    return skippedState(record.id, record.handle, "legacy", "mute", now);
+    return skippedState(target, "legacy", "mute", now);
   }
   if (/拉黑/.test(reason) && !failed) {
     return {
-      ...pendingState(record.id, record.handle, "legacy", now),
+      ...pendingState(target, "legacy", now),
       status: "succeeded",
       blockedAt: record.ts,
     };
   }
-  return pendingState(record.id, record.handle, "legacy", now);
+  return pendingState(target, "legacy", now);
+}
+
+interface RecordTarget {
+  record: BlockRecord;
+  target: DelayedBlockTarget;
+}
+
+/** Collapse duplicate handle-only rows when an immutable numeric identity exists. */
+function preferredRecordTargets(records: BlockRecord[]): RecordTarget[] {
+  const all = records
+    .map((record) => ({ record, target: delayedBlockTargetForRecord(record) }))
+    .filter((entry): entry is RecordTarget => entry.target !== null);
+  const numericHandles = new Set(
+    all.filter((entry) => entry.target.userId).map((entry) => entry.target.handle),
+  );
+  const byKey = new Map<string, RecordTarget>();
+  for (const entry of all) {
+    if (!entry.target.userId && numericHandles.has(entry.target.handle)) continue;
+    const previous = byKey.get(entry.target.key);
+    if (!previous || entry.record.ts >= previous.record.ts) byKey.set(entry.target.key, entry);
+  }
+  return [...byKey.values()];
+}
+
+function handleFallbackKey(target: DelayedBlockTarget): string | undefined {
+  return target.userId && target.handle ? `h:${target.handle}` : undefined;
 }
 
 /** Idempotently materialize queue/skip/success states for existing records. */
@@ -256,13 +350,55 @@ export async function ensureDelayedStatesForRecords(
   now = Date.now(),
 ): Promise<DelayedBlockStates> {
   const existing = await getDelayedBlockStates();
-  const hasMissing = records.some((record) => isNumericUserId(record.id) && !existing[record.id]);
-  if (!hasMissing) return existing;
+  const preferred = preferredRecordTargets(records);
+  const requiresWrite = preferred.some(({ target }) => {
+    const current = existing[target.key];
+    const fallback = handleFallbackKey(target) ? existing[handleFallbackKey(target)!] : undefined;
+    return (
+      !current ||
+      (!!fallback && fallback.skipReason !== "superseded") ||
+      (fallback?.status === "succeeded" && current.status !== "succeeded")
+    );
+  });
+  if (!requiresWrite) return existing;
   return mutateStates((states) => {
-    for (const record of records) {
-      if (!isNumericUserId(record.id) || states[record.id]) continue;
-      const initial = initialDelayedStateForRecord(record, now);
-      if (initial) states[record.id] = initial;
+    for (const { record, target } of preferredRecordTargets(records)) {
+      const fallbackKey = handleFallbackKey(target);
+      const fallback = fallbackKey ? states[fallbackKey] : undefined;
+      const current = states[target.key];
+      if (!current) {
+        const initial = initialDelayedStateForRecord(record, now);
+        // Only success is identity-level truth that may override the newer
+        // record's action policy. Pending/failed fallback state must not turn
+        // a later known mute or safety-capped record into a block candidate.
+        if (fallback?.status === "succeeded") {
+          states[target.key] = {
+            ...fallback,
+            targetKey: target.key,
+            ...(target.userId ? { userId: target.userId } : {}),
+            handle: target.handle,
+            updatedAt: now,
+          };
+        } else if (initial) {
+          states[target.key] = initial;
+        }
+      } else if (fallback?.status === "succeeded" && current.status !== "succeeded") {
+        states[target.key] = {
+          ...fallback,
+          targetKey: target.key,
+          ...(target.userId ? { userId: target.userId } : {}),
+          handle: target.handle,
+          updatedAt: now,
+        };
+      }
+      if (fallbackKey && fallback && fallback.skipReason !== "superseded") {
+        states[fallbackKey] = {
+          ...fallback,
+          status: "skipped",
+          skipReason: "superseded",
+          updatedAt: now,
+        };
+      }
     }
     return { ...states };
   });
@@ -275,13 +411,16 @@ export async function enqueueDelayedBlock(
   origin: Extract<DelayedBlockOrigin, "local_hide" | "direct_block_retry"> = "local_hide",
   now = Date.now(),
 ): Promise<void> {
-  if (!isNumericUserId(userId)) return;
+  const target = delayedBlockTarget(userId, handle);
+  if (!target) return;
   await mutateStates((states) => {
-    const current = states[userId];
+    const current = states[target.key];
     if (current?.status === "succeeded" || current?.status === "processing") return;
-    states[userId] = {
-      ...(current ?? pendingState(userId, handle, origin, now)),
-      handle,
+    states[target.key] = {
+      ...(current ?? pendingState(target, origin, now)),
+      targetKey: target.key,
+      ...(target.userId ? { userId: target.userId } : {}),
+      handle: target.handle,
       origin,
       status: "pending",
       updatedAt: now,
@@ -299,16 +438,19 @@ export async function recordDirectBlockResult(
   attempt: XActionAttempt,
   now = Date.now(),
 ): Promise<void> {
-  if (!isNumericUserId(userId)) return;
+  const target = delayedBlockTarget(userId, handle);
+  if (!target) return;
   await mutateStates((states) => {
-    const current = states[userId] ?? pendingState(userId, handle, "direct_block_retry", now);
+    const current = states[target.key] ?? pendingState(target, "direct_block_retry", now);
     // Once X acknowledged a block, a later duplicate/transient foreground
     // failure must never erase the durable dedupe truth.
     if (current.status === "succeeded" && !attempt.ok) return;
     if (attempt.ok) {
-      states[userId] = {
+      states[target.key] = {
         ...current,
-        handle,
+        targetKey: target.key,
+        ...(target.userId ? { userId: target.userId } : {}),
+        handle: target.handle,
         status: "succeeded",
         updatedAt: now,
         blockedAt: now,
@@ -319,9 +461,11 @@ export async function recordDirectBlockResult(
       };
       return;
     }
-    states[userId] = {
+    states[target.key] = {
       ...current,
-      handle,
+      targetKey: target.key,
+      ...(target.userId ? { userId: target.userId } : {}),
+      handle: target.handle,
       origin: "direct_block_retry",
       status: "pending",
       updatedAt: now,
@@ -350,9 +494,9 @@ export function selectNextDelayedBlock(
   states: DelayedBlockStates,
   now = Date.now(),
 ): DelayedBlockState | null {
-  const activeIds = new Set(records.filter((r) => isNumericUserId(r.id)).map((r) => r.id));
+  const activeIds = new Set(preferredRecordTargets(records).map(({ target }) => target.key));
   const candidates = Object.values(states).filter((state) => {
-    if (!activeIds.has(state.userId)) return false;
+    if (!activeIds.has(state.targetKey)) return false;
     if (state.status === "pending") return true;
     return state.status === "retry_wait" && (state.nextRetryAt ?? 0) <= now;
   });
@@ -365,11 +509,11 @@ export function selectNextDelayedBlock(
 }
 
 export async function markDelayedBlockProcessing(
-  userId: string,
+  targetKey: string,
   now = Date.now(),
 ): Promise<DelayedBlockState | null> {
   return mutateStates((states) => {
-    const state = states[userId];
+    const state = states[targetKey];
     if (!state || (state.status !== "pending" && state.status !== "retry_wait")) return null;
     state.status = "processing";
     state.attempts += 1;
@@ -388,12 +532,12 @@ export interface DelayedAttemptSettlement {
 }
 
 export async function settleDelayedBlockAttempt(
-  userId: string,
+  targetKey: string,
   attempt: XActionAttempt,
   now = Date.now(),
 ): Promise<DelayedAttemptSettlement | null> {
   return mutateStates((states) => {
-    const state = states[userId];
+    const state = states[targetKey];
     if (!state) return null;
     state.updatedAt = now;
     state.lastHttpStatus = attempt.status;
@@ -547,7 +691,9 @@ export function summarizeDelayedBlocks(
   meta: DelayedBlockMeta,
   now = Date.now(),
 ): DelayedBlockSummary {
-  const activeIds = new Set(records.filter((r) => isNumericUserId(r.id)).map((r) => r.id));
+  const preferred = preferredRecordTargets(records);
+  const activeIds = new Set(preferred.map(({ target }) => target.key));
+  const targets = records.map(delayedBlockTargetForRecord);
   const summary: DelayedBlockSummary = {
     pending: 0,
     processing: 0,
@@ -555,14 +701,15 @@ export function summarizeDelayedBlocks(
     retryWait: 0,
     failed: 0,
     skipped: 0,
-    missingUserId: records.filter((r) => !isNumericUserId(r.id)).length,
+    handleOnly: targets.filter((target) => target && !target.userId).length,
+    invalidTarget: targets.filter((target) => !target).length,
     hourAttempts: 0,
     dayAttempts: 0,
     ...(meta.nextRunAt ? { nextRunAt: meta.nextRunAt } : {}),
     ...(meta.pauseReason ? { pauseReason: meta.pauseReason } : {}),
   };
   for (const state of Object.values(states)) {
-    if (!activeIds.has(state.userId)) continue;
+    if (!activeIds.has(state.targetKey)) continue;
     if (state.status === "pending") summary.pending += 1;
     else if (state.status === "processing") summary.processing += 1;
     else if (state.status === "succeeded") summary.succeeded += 1;

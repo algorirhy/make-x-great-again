@@ -5,6 +5,7 @@ import {
   DELAYED_BLOCK_HOURLY_LIMIT,
   DELAYED_BLOCK_INTERVAL_MAX_MS,
   DELAYED_BLOCK_INTERVAL_MIN_MS,
+  delayedBlockTarget,
   delayedBlockRateDecision,
   ensureDelayedStatesForRecords,
   getDelayedBlockStates,
@@ -35,6 +36,7 @@ function record(patch: Partial<BlockRecord> = {}): BlockRecord {
 
 function state(patch: Partial<DelayedBlockState> = {}): DelayedBlockState {
   return {
+    targetKey: "123",
     userId: "123",
     handle: "target",
     status: "pending",
@@ -89,7 +91,25 @@ test("legacy migration includes ambiguous rows but excludes known mutes", () => 
     "pending",
   );
   assert.equal(initialDelayedStateForRecord(record({ reason: "色情 · 自动拉黑" }), NOW)?.status, "succeeded");
-  assert.equal(initialDelayedStateForRecord(record({ id: "h:target" }), NOW), null);
+  const handleOnly = initialDelayedStateForRecord(record({ id: "h:Target", handle: "@Target" }), NOW);
+  assert.equal(handleOnly?.status, "pending");
+  assert.equal(handleOnly?.targetKey, "h:target");
+  assert.equal(handleOnly?.userId, undefined);
+  assert.equal(initialDelayedStateForRecord(record({ id: "h:not-valid!", handle: "not-valid!" }), NOW), null);
+});
+
+test("target identity prefers numeric userId and validates handle fallback", () => {
+  assert.deepEqual(delayedBlockTarget("123", "@Mixed_Case"), {
+    key: "123",
+    userId: "123",
+    handle: "mixed_case",
+  });
+  assert.deepEqual(delayedBlockTarget(undefined, "@Mixed_Case"), {
+    key: "h:mixed_case",
+    handle: "mixed_case",
+  });
+  assert.equal(delayedBlockTarget(undefined, "not-valid!"), null);
+  assert.equal(delayedBlockTarget(undefined, "sixteen_chars____"), null);
 });
 
 test("candidate selection ignores orphan/success states and prioritizes direct retries", () => {
@@ -97,16 +117,26 @@ test("candidate selection ignores orphan/success states and prioritizes direct r
   const states: DelayedBlockStates = {
     "123": state({ status: "pending", createdAt: NOW - 20_000 }),
     "456": state({
+      targetKey: "456",
       userId: "456",
       handle: "second",
       origin: "direct_block_retry",
       createdAt: NOW - 5_000,
     }),
-    "789": state({ userId: "789", status: "pending" }), // record was restored locally
+    "789": state({ targetKey: "789", userId: "789", status: "pending" }), // restored locally
   };
-  assert.equal(selectNextDelayedBlock(records, states, NOW)?.userId, "456");
+  assert.equal(selectNextDelayedBlock(records, states, NOW)?.targetKey, "456");
   states["456"] = { ...states["456"]!, status: "succeeded" };
-  assert.equal(selectNextDelayedBlock(records, states, NOW)?.userId, "123");
+  assert.equal(selectNextDelayedBlock(records, states, NOW)?.targetKey, "123");
+});
+
+test("candidate selection includes handle-only rows", () => {
+  const records = [record({ id: "h:Target", handle: "@Target" })];
+  const states: DelayedBlockStates = {
+    "h:target": state({ targetKey: "h:target", userId: undefined, handle: "target" }),
+  };
+  assert.equal(selectNextDelayedBlock(records, states, NOW)?.targetKey, "h:target");
+  assert.equal(selectNextDelayedBlock(records, states, NOW)?.userId, undefined);
 });
 
 test("rolling hour/day request caps count attempts, not successes", () => {
@@ -169,6 +199,21 @@ test("persistent state transitions dedupe success and stop on auth/rate errors",
   };
 
   try {
+    memory["xss:delayed-block:states:v1"] = {
+      "777": {
+        userId: "777",
+        handle: "legacy",
+        status: "succeeded",
+        origin: "legacy",
+        attempts: 1,
+        createdAt: NOW - 20_000,
+        updatedAt: NOW - 20_000,
+      },
+    };
+    const migratedV1 = await getDelayedBlockStates();
+    assert.equal(migratedV1["777"]?.targetKey, "777");
+    assert.equal(migratedV1["777"]?.status, "succeeded");
+
     await ensureDelayedStatesForRecords([
       record({ requestedAction: "hide", effectiveAction: "hide", delayedBlockEligible: true }),
     ], NOW);
@@ -195,6 +240,39 @@ test("persistent state transitions dedupe success and stop on auth/rate errors",
     );
     assert.equal((await getDelayedBlockStates())["123"]?.status, "succeeded");
 
+    // A handle-only success is reused if a later record discovers the
+    // immutable userId, preventing a duplicate POST for the same handle.
+    await recordDirectBlockResult(undefined, "@HandleOnly", { ok: true, status: 200 }, NOW + 5);
+    assert.equal((await getDelayedBlockStates())["h:handleonly"]?.status, "succeeded");
+    await ensureDelayedStatesForRecords([
+      record({ id: "h:HandleOnly", handle: "HandleOnly" }),
+      record({ id: "999", handle: "HandleOnly" }),
+    ], NOW + 6);
+    const upgraded = await getDelayedBlockStates();
+    assert.equal(upgraded["999"]?.status, "succeeded");
+    assert.equal(upgraded["h:handleonly"]?.skipReason, "superseded");
+
+    // Pending handle state must not bypass a later, more precise mute policy.
+    await recordDirectBlockResult(
+      undefined,
+      "MutedLater",
+      { ok: false, status: 503, retryable: true },
+      NOW + 7,
+    );
+    await ensureDelayedStatesForRecords([
+      record({ id: "h:MutedLater", handle: "MutedLater" }),
+      record({
+        id: "998",
+        handle: "MutedLater",
+        requestedAction: "mute",
+        effectiveAction: "mute",
+        delayedBlockEligible: false,
+      }),
+    ], NOW + 8);
+    const mutedUpgrade = await getDelayedBlockStates();
+    assert.equal(mutedUpgrade["998"]?.status, "skipped");
+    assert.equal(mutedUpgrade["998"]?.skipReason, "mute");
+
     // Use a fresh target for 429 so the success ledger is never downgraded.
     await ensureDelayedStatesForRecords([
       record({
@@ -204,22 +282,22 @@ test("persistent state transitions dedupe success and stop on auth/rate errors",
         effectiveAction: "hide",
         delayedBlockEligible: true,
       }),
-    ], NOW + 5);
-    await markDelayedBlockProcessing("456", NOW + 6);
+    ], NOW + 9);
+    await markDelayedBlockProcessing("456", NOW + 10);
     const rate = await settleDelayedBlockAttempt(
       "456",
       { ok: false, status: 429, retryable: true, retryAfterMs: 1_000 },
-      NOW + 7,
+      NOW + 11,
     );
     assert.equal(rate?.stop?.reason, "http_429");
-    assert.equal(rate?.stop?.until, NOW + 7 + 60 * 60_000);
+    assert.equal(rate?.stop?.until, NOW + 11 + 60 * 60_000);
 
     memory["xss:delayed-block:meta:v1"] = {
       attemptTimestamps: [],
       pauseReason: "http_429",
       pausedUntil: NOW + 60 * 60_000,
     };
-    assert.equal(await recordDelayedBlockAttempt(NOW + 8), null);
+    assert.equal(await recordDelayedBlockAttempt(NOW + 12), null);
   } finally {
     if (previousChrome === undefined) delete root.chrome;
     else root.chrome = previousChrome;
