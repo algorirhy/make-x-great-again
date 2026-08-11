@@ -140,6 +140,8 @@ test("candidate selection includes handle-only rows", () => {
 });
 
 test("rolling hour/day request caps count attempts, not successes", () => {
+  assert.equal(DELAYED_BLOCK_HOURLY_LIMIT, 60);
+  assert.equal(DELAYED_BLOCK_DAILY_LIMIT, 360);
   const hour = Array.from(
     { length: DELAYED_BLOCK_HOURLY_LIMIT },
     (_, i) => NOW - 50 * 60_000 + i * 1_000,
@@ -150,7 +152,10 @@ test("rolling hour/day request caps count attempts, not successes", () => {
 
   const day = Array.from(
     { length: DELAYED_BLOCK_DAILY_LIMIT },
-    (_, i) => NOW - 23 * 60 * 60_000 + i * 6 * 60_000,
+    (_, i) =>
+      NOW -
+      23 * 60 * 60_000 +
+      i * Math.floor((22 * 60 * 60_000) / (DELAYED_BLOCK_DAILY_LIMIT - 1)),
   );
   const dayDecision = delayedBlockRateDecision(day, NOW);
   assert.equal(dayDecision.allowed, false);
@@ -159,8 +164,9 @@ test("rolling hour/day request caps count attempts, not successes", () => {
   assert.equal(delayedBlockRateDecision([], NOW).allowed, true);
 });
 
-test("random interval remains within the documented 1-2 minute range", () => {
+test("random interval remains within the documented 45-75 second range", () => {
   assert.equal(randomDelayedBlockInterval(() => 0), DELAYED_BLOCK_INTERVAL_MIN_MS);
+  assert.equal(randomDelayedBlockInterval(() => 0.5), 60_000);
   assert.equal(randomDelayedBlockInterval(() => 1), DELAYED_BLOCK_INTERVAL_MAX_MS);
 });
 

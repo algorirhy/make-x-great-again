@@ -1716,7 +1716,7 @@ function Settings() {
                   绑定账号：<b className="text-fg">{st.delayedBlockOwnerHandle ? `@${st.delayedBlockOwnerHandle}` : "未绑定"}</b>
                 </span>
                 <span>
-                  固定限速：<b className="text-fg">1～2 分钟/个 · {DELAYED_BLOCK_HOURLY_LIMIT}/小时 · {DELAYED_BLOCK_DAILY_LIMIT}/24小时</b>
+                  固定限速：<b className="text-fg">45～75 秒/个 · {DELAYED_BLOCK_HOURLY_LIMIT}/小时 · {DELAYED_BLOCK_DAILY_LIMIT}/24小时</b>
                 </span>
               </div>
               {delayedSummary && (
