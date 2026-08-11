@@ -27,6 +27,11 @@ otherwise.
 
 ### Changed
 
+- Legacy rows labeled as automatic blocks are queued instead of being treated
+  as confirmed successes: older builds wrote that label before X acknowledged
+  the request. Existing zero-attempt legacy success markers are requeued once.
+- Per-record delayed status pills keep handle fallback details in their tooltip
+  instead of displaying the implementation detail in the visible label.
 - Consolidated the macOS and iOS containers and Safari extensions into one Xcode project with
   four platform-specific targets; deployment baselines are now macOS 15 and iOS 18.
 - Safari's in-page blacklist index now retains compact lite rows and expands display data only

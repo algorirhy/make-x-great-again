@@ -20,6 +20,7 @@ import {
   type DelayedBlockSummary,
   clearDelayedBlockStop,
   delayedBlockTargetForRecord,
+  ensureDelayedStatesForRecords,
   getDelayedBlockMeta,
   getDelayedBlockStates,
   summarizeDelayedBlocks,
@@ -112,11 +113,11 @@ function DelayedBlockTag({ record, state }: { record: BlockRecord; state?: Delay
   if (!state) {
     if (record.requestedAction === "mute") return <span className="text-[11px] text-fg-3">X 静音</span>;
     if (record.requestedAction === "block") return <span className="text-[11px] text-fg-3">即时拉黑处理中</span>;
-    return <span className="text-[11px] text-fg-3">{viaHandle ? "仅有 handle · 尚未入队" : "尚未建立队列"}</span>;
+    return <span className="text-[11px] text-fg-3">尚未建立队列</span>;
   }
   const map: Record<DelayedBlockState["status"], { text: string; cls: string }> = {
-    pending: { text: viaHandle ? "待 X 拉黑 · handle" : "待 X 拉黑", cls: "text-warn border-warn/40" },
-    processing: { text: viaHandle ? "X 拉黑中 · handle" : "X 拉黑中", cls: "text-accent border-accent/40" },
+    pending: { text: "待 X 拉黑", cls: "text-warn border-warn/40" },
+    processing: { text: "X 拉黑中", cls: "text-accent border-accent/40" },
     succeeded: { text: "已 X 拉黑", cls: "text-ok border-ok/40" },
     retry_wait: { text: "等待重试", cls: "text-warn border-warn/40" },
     failed: { text: "X 拉黑失败", cls: "text-danger border-danger/40" },
@@ -1660,7 +1661,10 @@ function Settings() {
       await save("delayedBlockOwnerHandle", ownerHandle);
       await clearDelayedBlockStop();
       await save("delayedAutoBlock", true);
-      const [states, meta] = await Promise.all([getDelayedBlockStates(), getDelayedBlockMeta()]);
+      const [states, meta] = await Promise.all([
+        ensureDelayedStatesForRecords(records),
+        getDelayedBlockMeta(),
+      ]);
       setDelayedSummary(summarizeDelayedBlocks(records, states, meta));
       setDelayedMsg(`已绑定 @${ownerHandle}；历史状态不明记录已按“数字 ID 优先、handle 兜底”加入队列。`);
     } catch {

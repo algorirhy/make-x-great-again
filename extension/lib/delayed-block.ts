@@ -304,18 +304,37 @@ export function initialDelayedStateForRecord(
   }
 
   const reason = record.reason ?? "";
-  const failed = /失败|仅本地隐藏/.test(reason);
   if (/静音/.test(reason)) {
     return skippedState(target, "legacy", "mute", now);
   }
-  if (/拉黑/.test(reason) && !failed) {
-    return {
-      ...pendingState(target, "legacy", now),
-      status: "succeeded",
-      blockedAt: record.ts,
-    };
-  }
+  // Legacy text describes the requested action, not a durable X response:
+  // the old queue wrote "自动拉黑" before sending the request. Treat every
+  // non-mute legacy row as pending so an interrupted write cannot be mistaken
+  // for verified success after storage migration.
   return pendingState(target, "legacy", now);
+}
+
+function isUnverifiedLegacySuccess(state: DelayedBlockState | undefined): boolean {
+  return (
+    state?.status === "succeeded" && state.origin === "legacy" && state.attempts === 0
+  );
+}
+
+function requeueUnverifiedLegacySuccess(
+  state: DelayedBlockState,
+  now: number,
+): DelayedBlockState {
+  const next: DelayedBlockState = {
+    ...state,
+    status: "pending",
+    updatedAt: now,
+  };
+  delete next.blockedAt;
+  delete next.nextRetryAt;
+  delete next.lastHttpStatus;
+  delete next.lastError;
+  delete next.skipReason;
+  return next;
 }
 
 interface RecordTarget {
@@ -356,8 +375,11 @@ export async function ensureDelayedStatesForRecords(
     const fallback = handleFallbackKey(target) ? existing[handleFallbackKey(target)!] : undefined;
     return (
       !current ||
+      isUnverifiedLegacySuccess(current) ||
       (!!fallback && fallback.skipReason !== "superseded") ||
-      (fallback?.status === "succeeded" && current.status !== "succeeded")
+      (fallback?.status === "succeeded" &&
+        !isUnverifiedLegacySuccess(fallback) &&
+        current.status !== "succeeded")
     );
   });
   if (!requiresWrite) return existing;
@@ -365,13 +387,19 @@ export async function ensureDelayedStatesForRecords(
     for (const { record, target } of preferredRecordTargets(records)) {
       const fallbackKey = handleFallbackKey(target);
       const fallback = fallbackKey ? states[fallbackKey] : undefined;
-      const current = states[target.key];
+      let current = states[target.key];
+      if (isUnverifiedLegacySuccess(current) && current) {
+        current = requeueUnverifiedLegacySuccess(current, now);
+        states[target.key] = current;
+      }
+      const verifiedFallbackSuccess =
+        fallback?.status === "succeeded" && !isUnverifiedLegacySuccess(fallback);
       if (!current) {
         const initial = initialDelayedStateForRecord(record, now);
         // Only success is identity-level truth that may override the newer
         // record's action policy. Pending/failed fallback state must not turn
         // a later known mute or safety-capped record into a block candidate.
-        if (fallback?.status === "succeeded") {
+        if (verifiedFallbackSuccess && fallback) {
           states[target.key] = {
             ...fallback,
             targetKey: target.key,
@@ -382,7 +410,7 @@ export async function ensureDelayedStatesForRecords(
         } else if (initial) {
           states[target.key] = initial;
         }
-      } else if (fallback?.status === "succeeded" && current.status !== "succeeded") {
+      } else if (verifiedFallbackSuccess && fallback && current.status !== "succeeded") {
         states[target.key] = {
           ...fallback,
           targetKey: target.key,

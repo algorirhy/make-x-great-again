@@ -90,7 +90,7 @@ test("legacy migration includes ambiguous rows but excludes known mutes", () => 
     initialDelayedStateForRecord(record({ reason: "自动拉黑（X 动作失败，仅本地隐藏）" }), NOW)?.status,
     "pending",
   );
-  assert.equal(initialDelayedStateForRecord(record({ reason: "色情 · 自动拉黑" }), NOW)?.status, "succeeded");
+  assert.equal(initialDelayedStateForRecord(record({ reason: "色情 · 自动拉黑" }), NOW)?.status, "pending");
   const handleOnly = initialDelayedStateForRecord(record({ id: "h:Target", handle: "@Target" }), NOW);
   assert.equal(handleOnly?.status, "pending");
   assert.equal(handleOnly?.targetKey, "h:target");
@@ -206,6 +206,16 @@ test("persistent state transitions dedupe success and stop on auth/rate errors",
 
   try {
     memory["xss:delayed-block:states:v1"] = {
+      "776": {
+        userId: "776",
+        handle: "unverified",
+        status: "succeeded",
+        origin: "legacy",
+        attempts: 0,
+        blockedAt: NOW - 20_000,
+        createdAt: NOW - 20_000,
+        updatedAt: NOW - 20_000,
+      },
       "777": {
         userId: "777",
         handle: "legacy",
@@ -222,8 +232,13 @@ test("persistent state transitions dedupe success and stop on auth/rate errors",
 
     await ensureDelayedStatesForRecords([
       record({ requestedAction: "hide", effectiveAction: "hide", delayedBlockEligible: true }),
+      record({ id: "776", handle: "unverified", reason: "色情 · 自动拉黑" }),
     ], NOW);
-    assert.equal((await getDelayedBlockStates())["123"]?.status, "pending");
+    const initialized = await getDelayedBlockStates();
+    assert.equal(initialized["123"]?.status, "pending");
+    assert.equal(initialized["776"]?.status, "pending");
+    assert.equal(initialized["776"]?.blockedAt, undefined);
+    assert.equal(initialized["777"]?.status, "succeeded");
 
     await markDelayedBlockProcessing("123", NOW + 1);
     const auth = await settleDelayedBlockAttempt(
