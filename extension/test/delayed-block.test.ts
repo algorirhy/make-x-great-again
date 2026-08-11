@@ -9,13 +9,17 @@ import {
   delayedBlockRateDecision,
   enqueueDelayedBlock,
   ensureDelayedStatesForRecords,
+  getDelayedBlockMeta,
   getDelayedBlockStates,
+  hasActiveDelayedBlockTarget,
   initialDelayedStateForRecord,
+  isDelayedBlockHardStopped,
   markDelayedBlockProcessing,
   randomDelayedBlockInterval,
   recordDelayedBlockAttempt,
   recordDirectBlockResult,
   selectNextDelayedBlock,
+  setDelayedBlockPause,
   settleDelayedBlockAttempt,
   summarizeDelayedBlocks,
   type DelayedBlockState,
@@ -141,6 +145,15 @@ test("candidate selection includes handle-only rows", () => {
   assert.equal(selectNextDelayedBlock(records, states, NOW)?.userId, undefined);
 });
 
+test("numeric identity supersedes a stale handle candidate", () => {
+  const records = [
+    record({ id: "h:Target", handle: "Target" }),
+    record({ id: "999", handle: "target", ts: NOW }),
+  ];
+  assert.equal(hasActiveDelayedBlockTarget(records, "h:target"), false);
+  assert.equal(hasActiveDelayedBlockTarget(records, "999"), true);
+});
+
 test("stored 404 failures are presented as unavailable before migration persists", () => {
   const summary = summarizeDelayedBlocks(
     [record()],
@@ -183,6 +196,27 @@ test("rolling hour/day request caps count attempts, not successes", () => {
   assert.equal(dayDecision.reason, "daily_limit");
 
   assert.equal(delayedBlockRateDecision([], NOW).allowed, true);
+});
+
+test("hard stops distinguish active and expired cooldowns", () => {
+  assert.equal(
+    isDelayedBlockHardStopped({ attemptTimestamps: [], pauseReason: "http_401" }, NOW),
+    true,
+  );
+  assert.equal(
+    isDelayedBlockHardStopped(
+      { attemptTimestamps: [], pauseReason: "http_429", pausedUntil: NOW + 1 },
+      NOW,
+    ),
+    true,
+  );
+  assert.equal(
+    isDelayedBlockHardStopped(
+      { attemptTimestamps: [], pauseReason: "http_429", pausedUntil: NOW - 1 },
+      NOW,
+    ),
+    false,
+  );
 });
 
 test("random interval remains within the documented 45-75 second range", () => {
@@ -401,12 +435,17 @@ test("persistent state transitions dedupe success and stop on auth/rate errors",
     assert.equal(rate?.stop?.reason, "http_429");
     assert.equal(rate?.stop?.until, NOW + 18 + 60 * 60_000);
 
+    await setDelayedBlockPause("disabled", NOW + 19);
+    const disabled = await getDelayedBlockMeta();
+    assert.equal(disabled.pauseReason, "disabled");
+    assert.equal(disabled.nextRunAt, undefined);
+
     memory["xss:delayed-block:meta:v1"] = {
       attemptTimestamps: [],
       pauseReason: "http_429",
       pausedUntil: NOW + 60 * 60_000,
     };
-    assert.equal(await recordDelayedBlockAttempt(NOW + 19), null);
+    assert.equal(await recordDelayedBlockAttempt(NOW + 20), null);
   } finally {
     if (previousChrome === undefined) delete root.chrome;
     else root.chrome = previousChrome;

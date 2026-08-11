@@ -24,6 +24,8 @@ import {
   getDelayedBlockMeta,
   getDelayedBlockStates,
   isTargetUnavailableDelayedBlockState,
+  normalizeDelayedBlockHandle,
+  setDelayedBlockPause,
   summarizeDelayedBlocks,
 } from "../../lib/delayed-block";
 import {
@@ -1640,6 +1642,7 @@ function Settings() {
     setDelayedMsg("");
     if (!enabled) {
       await save("delayedAutoBlock", false);
+      await setDelayedBlockPause("disabled").catch(() => {});
       setDelayedMsg("已暂停；队列和成功记录仍保留在本机。");
       return;
     }
@@ -1654,8 +1657,8 @@ function Settings() {
     } catch {
       /* handled by the missing-viewer branch below */
     }
-    const captured = viewer["xss:viewer"] as { handle?: string; ts?: number } | undefined;
-    const ownerHandle = String(captured?.handle ?? "").trim().replace(/^@+/, "");
+    const captured = viewer["xss:viewer"] as { handle?: string } | undefined;
+    const ownerHandle = normalizeDelayedBlockHandle(captured?.handle);
     if (!ownerHandle) {
       setDelayedMsg("尚未识别当前 X 账号。请打开或刷新一次已登录的 x.com 页面后再开启。");
       return;
@@ -1709,8 +1712,8 @@ function Settings() {
           <section>
             <SectionH>延迟自动 X 拉黑</SectionH>
             <p className="mb-3 text-[12px] leading-relaxed text-fg-3">
-              将<b className="text-fg-2">明确选择为本地隐藏</b>的账号排队，在已登录的 X 页面中低频执行原生拉黑；
-              静音账号和因「自动收录封顶」而降级的本地隐藏不会升级。历史状态不明记录默认加入。
+              先立即本地隐藏，再在已登录的 X 页面中低频拉黑。推荐用它替代大量即时自动拉黑；
+              仍配置为 X 拉黑的动作不会被延迟。静音和安全封顶记录不会升级。
             </p>
             <Toggle
               on={st.delayedAutoBlock}
@@ -1724,7 +1727,7 @@ function Settings() {
                   绑定账号：<b className="text-fg">{st.delayedBlockOwnerHandle ? `@${st.delayedBlockOwnerHandle}` : "未绑定"}</b>
                 </span>
                 <span>
-                  固定限速：<b className="text-fg">45～75 秒/个 · {DELAYED_BLOCK_HOURLY_LIMIT}/小时 · {DELAYED_BLOCK_DAILY_LIMIT}/24小时</b>
+                  队列限速：<b className="text-fg">45～75 秒/个 · {DELAYED_BLOCK_HOURLY_LIMIT}/小时 · {DELAYED_BLOCK_DAILY_LIMIT}/滚动24小时</b>
                 </span>
               </div>
               {delayedSummary && (

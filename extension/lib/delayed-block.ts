@@ -95,13 +95,15 @@ export interface DelayedBlockSummary {
   pauseReason?: DelayedBlockPauseReason;
 }
 
-export interface RateDecision {
-  allowed: boolean;
-  reason?: "hourly_limit" | "daily_limit";
-  nextAt?: number;
-  hourAttempts: number;
-  dayAttempts: number;
-}
+export type RateDecision =
+  | { allowed: true; hourAttempts: number; dayAttempts: number }
+  | {
+      allowed: false;
+      reason: "hourly_limit" | "daily_limit";
+      nextAt: number;
+      hourAttempts: number;
+      dayAttempts: number;
+    };
 
 type LockCapableNavigator = Navigator & {
   locks?: {
@@ -273,6 +275,22 @@ function skippedState(
   };
 }
 
+function retargetState(
+  state: DelayedBlockState,
+  target: DelayedBlockTarget,
+  patch: Partial<DelayedBlockState> = {},
+): DelayedBlockState {
+  const next: DelayedBlockState = {
+    ...state,
+    ...patch,
+    targetKey: target.key,
+    handle: target.handle,
+  };
+  if (target.userId) next.userId = target.userId;
+  else delete next.userId;
+  return next;
+}
+
 /**
  * Derive a missing queue entry from an audit record.
  *
@@ -323,6 +341,10 @@ function isUnverifiedLegacySuccess(state: DelayedBlockState | undefined): boolea
   return (
     state?.status === "succeeded" && state.origin === "legacy" && state.attempts === 0
   );
+}
+
+function isVerifiedSuccess(state: DelayedBlockState | undefined): state is DelayedBlockState {
+  return state?.status === "succeeded" && !isUnverifiedLegacySuccess(state);
 }
 
 function requeueUnverifiedLegacySuccess(
@@ -398,6 +420,13 @@ function handleFallbackKey(target: DelayedBlockTarget): string | undefined {
   return target.userId && target.handle ? `h:${target.handle}` : undefined;
 }
 
+export function hasActiveDelayedBlockTarget(
+  records: BlockRecord[],
+  targetKey: string,
+): boolean {
+  return preferredRecordTargets(records).some(({ target }) => target.key === targetKey);
+}
+
 /** Idempotently materialize queue/skip/success states for existing records. */
 export async function ensureDelayedStatesForRecords(
   records: BlockRecord[],
@@ -407,15 +436,14 @@ export async function ensureDelayedStatesForRecords(
   const preferred = preferredRecordTargets(records);
   const requiresWrite = preferred.some(({ target }) => {
     const current = existing[target.key];
-    const fallback = handleFallbackKey(target) ? existing[handleFallbackKey(target)!] : undefined;
+    const fallbackKey = handleFallbackKey(target);
+    const fallback = fallbackKey ? existing[fallbackKey] : undefined;
     return (
       !current ||
       needsTargetUnavailableMigration(current) ||
       isUnverifiedLegacySuccess(current) ||
       (!!fallback && fallback.skipReason !== "superseded") ||
-      (fallback?.status === "succeeded" &&
-        !isUnverifiedLegacySuccess(fallback) &&
-        current.status !== "succeeded")
+      (isVerifiedSuccess(fallback) && current.status !== "succeeded")
     );
   });
   if (!requiresWrite) return existing;
@@ -431,32 +459,19 @@ export async function ensureDelayedStatesForRecords(
         current = requeueUnverifiedLegacySuccess(current, now);
         states[target.key] = current;
       }
-      const verifiedFallbackSuccess =
-        fallback?.status === "succeeded" && !isUnverifiedLegacySuccess(fallback);
+      const verifiedFallbackSuccess = isVerifiedSuccess(fallback);
       if (!current) {
         const initial = initialDelayedStateForRecord(record, now);
         // Only success is identity-level truth that may override the newer
         // record's action policy. Pending/failed fallback state must not turn
         // a later known mute or safety-capped record into a block candidate.
         if (verifiedFallbackSuccess && fallback) {
-          states[target.key] = {
-            ...fallback,
-            targetKey: target.key,
-            ...(target.userId ? { userId: target.userId } : {}),
-            handle: target.handle,
-            updatedAt: now,
-          };
+          states[target.key] = retargetState(fallback, target, { updatedAt: now });
         } else if (initial) {
           states[target.key] = initial;
         }
       } else if (verifiedFallbackSuccess && fallback && current.status !== "succeeded") {
-        states[target.key] = {
-          ...fallback,
-          targetKey: target.key,
-          ...(target.userId ? { userId: target.userId } : {}),
-          handle: target.handle,
-          updatedAt: now,
-        };
+        states[target.key] = retargetState(fallback, target, { updatedAt: now });
       }
       if (fallbackKey && fallback && fallback.skipReason !== "superseded") {
         states[fallbackKey] = {
@@ -489,18 +504,14 @@ export async function enqueueDelayedBlock(
     ) {
       return;
     }
-    states[target.key] = {
-      ...(current ?? pendingState(target, origin, now)),
-      targetKey: target.key,
-      ...(target.userId ? { userId: target.userId } : {}),
-      handle: target.handle,
+    states[target.key] = retargetState(current ?? pendingState(target, origin, now), target, {
       origin,
       status: "pending",
       updatedAt: now,
       nextRetryAt: undefined,
       lastError: undefined,
       skipReason: undefined,
-    };
+    });
   });
 }
 
@@ -519,11 +530,7 @@ export async function recordDirectBlockResult(
     // failure must never erase the durable dedupe truth.
     if (current.status === "succeeded" && !attempt.ok) return;
     if (attempt.ok) {
-      states[target.key] = {
-        ...current,
-        targetKey: target.key,
-        ...(target.userId ? { userId: target.userId } : {}),
-        handle: target.handle,
+      states[target.key] = retargetState(current, target, {
         status: "succeeded",
         updatedAt: now,
         blockedAt: now,
@@ -531,28 +538,20 @@ export async function recordDirectBlockResult(
         nextRetryAt: undefined,
         lastError: undefined,
         skipReason: undefined,
-      };
+      });
       return;
     }
     if (attempt.status === 404) {
       states[target.key] = targetUnavailableState(
-        {
-          ...current,
-          targetKey: target.key,
-          ...(target.userId ? { userId: target.userId } : {}),
-          handle: target.handle,
+        retargetState(current, target, {
           origin: "direct_block_retry",
           lastHttpStatus: 404,
-        },
+        }),
         now,
       );
       return;
     }
-    states[target.key] = {
-      ...current,
-      targetKey: target.key,
-      ...(target.userId ? { userId: target.userId } : {}),
-      handle: target.handle,
+    states[target.key] = retargetState(current, target, {
       origin: "direct_block_retry",
       status: "pending",
       updatedAt: now,
@@ -560,7 +559,7 @@ export async function recordDirectBlockResult(
       lastError: attempt.status ? `HTTP ${attempt.status}` : "network_error",
       nextRetryAt: undefined,
       skipReason: undefined,
-    };
+    });
   });
 }
 
@@ -686,6 +685,18 @@ export function trimAttemptTimestamps(timestamps: number[], now = Date.now()): n
   return timestamps.filter((ts) => Number.isFinite(ts) && ts > floor && ts <= ceiling);
 }
 
+export function isDelayedBlockHardStopped(
+  meta: DelayedBlockMeta,
+  now = Date.now(),
+): boolean {
+  return (
+    meta.pauseReason === "http_401" ||
+    meta.pauseReason === "http_403" ||
+    (meta.pauseReason === "http_429" &&
+      (meta.pausedUntil ?? Number.POSITIVE_INFINITY) > now)
+  );
+}
+
 export function delayedBlockRateDecision(
   timestamps: number[],
   now = Date.now(),
@@ -724,12 +735,7 @@ export async function recordDelayedBlockAttempt(
   now = Date.now(),
 ): Promise<DelayedBlockMeta | null> {
   return mutateMeta((meta) => {
-    const hardStopped =
-      meta.pauseReason === "http_401" ||
-      meta.pauseReason === "http_403" ||
-      (meta.pauseReason === "http_429" &&
-        (meta.pausedUntil ?? Number.POSITIVE_INFINITY) > now);
-    if (hardStopped || (meta.nextRunAt ?? 0) > now) return null;
+    if (isDelayedBlockHardStopped(meta, now) || (meta.nextRunAt ?? 0) > now) return null;
 
     const rate = delayedBlockRateDecision(meta.attemptTimestamps, now);
     if (!rate.allowed) {
@@ -760,6 +766,20 @@ export async function updateDelayedBlockMeta(
       if (patch[key] === undefined) delete meta[key];
     }
     return { ...meta };
+  });
+}
+
+export function setDelayedBlockPause(
+  reason: DelayedBlockPauseReason,
+  now = Date.now(),
+  until?: number,
+): Promise<DelayedBlockMeta> {
+  return updateDelayedBlockMeta({
+    pauseReason: reason,
+    pausedAt: now,
+    pausedUntil: until,
+    nextRunAt: until,
+    lastRunnerAt: now,
   });
 }
 

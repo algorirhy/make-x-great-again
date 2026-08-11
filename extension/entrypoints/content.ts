@@ -5,18 +5,20 @@ import { BRAND } from "../lib/brand";
 import { type Cached, cacheGet, signalsHash } from "../lib/cache";
 import {
   clearDelayedBlockStop,
-  delayedBlockTargetForRecord,
   delayedBlockRateDecision,
   enqueueDelayedBlock,
   ensureDelayedStatesForRecords,
   getDelayedBlockMeta,
-  getDelayedBlockStates,
+  hasActiveDelayedBlockTarget,
+  isDelayedBlockHardStopped,
   markDelayedBlockProcessing,
+  normalizeDelayedBlockHandle,
   randomDelayedBlockInterval,
   recordDelayedBlockAttempt,
   recordDirectBlockResult,
   recoverProcessingDelayedBlocks,
   selectNextDelayedBlock,
+  setDelayedBlockPause,
   settleDelayedBlockAttempt,
   updateDelayedBlockMeta,
 } from "../lib/delayed-block";
@@ -81,6 +83,8 @@ function openAppeal(appeal?: { handle: string; userId?: string }): void {
  *  lock still paces each one; anything beyond the cap settles on later loads. */
 const RESUME_MAX = 50;
 const DELAYED_BLOCK_RUNNER_LOCK = "mxga-delayed-block-runner";
+const DELAYED_BLOCK_POLL_MS = 30_000;
+const DELAYED_BLOCK_STORAGE_RETRY_MS = 5 * 60_000;
 
 type RunnerLockNavigator = Navigator & {
   locks?: {
@@ -107,6 +111,43 @@ function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
     }
     signal.addEventListener("abort", aborted, { once: true });
   });
+}
+
+function delayedBlockEnabled(settings: Settings): boolean {
+  return settings.enabled && settings.delayedAutoBlock;
+}
+
+function runnerWaitMs(now: number, until?: number): number {
+  return until === undefined
+    ? DELAYED_BLOCK_POLL_MS
+    : Math.min(DELAYED_BLOCK_POLL_MS, Math.max(1_000, until - now));
+}
+
+async function canRunDelayedTarget(
+  targetKey: string,
+  ownerHandle: string,
+  checkSchedule: boolean,
+): Promise<boolean> {
+  const now = Date.now();
+  const [liveSettings, records, meta] = await Promise.all([
+    getSettings(),
+    getBlocklist(),
+    getDelayedBlockMeta(),
+  ]);
+  if (
+    !delayedBlockEnabled(liveSettings) ||
+    normalizeDelayedBlockHandle(liveSettings.delayedBlockOwnerHandle) !== ownerHandle ||
+    normalizeDelayedBlockHandle(viewerHandle()) !== ownerHandle ||
+    !hasActiveDelayedBlockTarget(records, targetKey) ||
+    isDelayedBlockHardStopped(meta, now)
+  ) {
+    return false;
+  }
+  if (!checkSchedule) return true;
+  return (
+    (meta.nextRunAt ?? 0) <= now &&
+    delayedBlockRateDecision(meta.attemptTimestamps, now).allowed
+  );
 }
 
 /** Report an unlisted account to the public review queue. GitHub-authed
@@ -230,13 +271,7 @@ async function applyXAction(mode: ActionMode, sig: Signals): Promise<boolean> {
       finalAttempt.status === 429
         ? now + Math.max(60 * 60_000, finalAttempt.retryAfterMs ?? 0)
         : undefined;
-    await updateDelayedBlockMeta({
-      pauseReason: reason,
-      pausedAt: now,
-      pausedUntil: until,
-      nextRunAt: until,
-      lastRunnerAt: now,
-    }).catch(() => {});
+    await setDelayedBlockPause(reason, now, until).catch(() => {});
   }
   return finalAttempt.ok;
 }
@@ -374,7 +409,7 @@ export default defineContentScript({
     }
 
     function syncDelayedBlockRunner() {
-      if (!settings.enabled || !settings.delayedAutoBlock) {
+      if (!delayedBlockEnabled(settings)) {
         stopDelayedBlockRunner();
         return;
       }
@@ -399,28 +434,16 @@ export default defineContentScript({
           const now = Date.now();
           try {
             const liveSettings = await getSettings();
-            if (!liveSettings.enabled || !liveSettings.delayedAutoBlock) {
-              await updateDelayedBlockMeta({
-                pauseReason: "disabled",
-                pausedAt: now,
-                pausedUntil: undefined,
-                nextRunAt: undefined,
-                lastRunnerAt: now,
-              });
+            if (!delayedBlockEnabled(liveSettings)) {
+              await setDelayedBlockPause("disabled", now);
               return;
             }
 
-            const currentViewer = viewerHandle()?.toLowerCase();
-            let owner = liveSettings.delayedBlockOwnerHandle.trim().replace(/^@+/, "").toLowerCase();
+            const currentViewer = normalizeDelayedBlockHandle(viewerHandle());
+            let owner = normalizeDelayedBlockHandle(liveSettings.delayedBlockOwnerHandle);
             if (!currentViewer) {
-              await updateDelayedBlockMeta({
-                pauseReason: "not_logged_in",
-                pausedAt: now,
-                pausedUntil: undefined,
-                nextRunAt: undefined,
-                lastRunnerAt: now,
-              });
-              await abortableSleep(30_000, signal);
+              await setDelayedBlockPause("not_logged_in", now);
+              await abortableSleep(DELAYED_BLOCK_POLL_MS, signal);
               continue;
             }
             // Backward-safe fallback for a setting imported/enabled without
@@ -431,14 +454,8 @@ export default defineContentScript({
               owner = currentViewer;
             }
             if (currentViewer !== owner) {
-              await updateDelayedBlockMeta({
-                pauseReason: "account_mismatch",
-                pausedAt: now,
-                pausedUntil: undefined,
-                nextRunAt: undefined,
-                lastRunnerAt: now,
-              });
-              await abortableSleep(30_000, signal);
+              await setDelayedBlockPause("account_mismatch", now);
+              await abortableSleep(DELAYED_BLOCK_POLL_MS, signal);
               continue;
             }
 
@@ -452,8 +469,13 @@ export default defineContentScript({
             if (meta.pauseReason === "http_429") {
               const until = meta.pausedUntil ?? now + 60 * 60_000;
               if (until > now) {
-                await updateDelayedBlockMeta({ nextRunAt: until, lastRunnerAt: now });
-                await abortableSleep(Math.min(30_000, until - now), signal);
+                await updateDelayedBlockMeta({
+                  pausedAt: meta.pausedAt ?? now,
+                  pausedUntil: until,
+                  nextRunAt: until,
+                  lastRunnerAt: now,
+                });
+                await abortableSleep(runnerWaitMs(now, until), signal);
                 continue;
               }
               await clearDelayedBlockStop();
@@ -462,59 +484,27 @@ export default defineContentScript({
 
             const rate = delayedBlockRateDecision(meta.attemptTimestamps, now);
             if (!rate.allowed) {
-              await updateDelayedBlockMeta({
-                pauseReason: rate.reason,
-                pausedAt: now,
-                pausedUntil: rate.nextAt,
-                nextRunAt: rate.nextAt,
-                lastRunnerAt: now,
-              });
-              await abortableSleep(Math.min(30_000, Math.max(1_000, (rate.nextAt ?? now) - now)), signal);
+              await setDelayedBlockPause(rate.reason, now, rate.nextAt);
+              await abortableSleep(runnerWaitMs(now, rate.nextAt), signal);
               continue;
             }
 
             if ((meta.nextRunAt ?? 0) > now) {
-              await abortableSleep(Math.min(30_000, (meta.nextRunAt ?? now) - now), signal);
+              await abortableSleep(runnerWaitMs(now, meta.nextRunAt), signal);
               continue;
             }
 
             const next = selectNextDelayedBlock(records, states, now);
             if (!next) {
-              await updateDelayedBlockMeta({
-                pauseReason: "idle",
-                pausedAt: now,
-                pausedUntil: undefined,
-                nextRunAt: undefined,
-                lastRunnerAt: now,
-              });
-              await abortableSleep(30_000, signal);
+              await setDelayedBlockPause("idle", now);
+              await abortableSleep(DELAYED_BLOCK_POLL_MS, signal);
               continue;
             }
 
             // Re-read all safety inputs immediately before committing the
             // attempt: the user may have restored the row, disabled the
             // switch, or changed X accounts while this tab was waiting.
-            const latestSettings = await getSettings();
-            const latestRecords = await getBlocklist();
-            const latestMeta = await getDelayedBlockMeta();
-            const stillPresent = latestRecords.some(
-              (record) => delayedBlockTargetForRecord(record)?.key === next.targetKey,
-            );
-            const latestViewer = viewerHandle()?.toLowerCase();
-            const latestRate = delayedBlockRateDecision(latestMeta.attemptTimestamps, Date.now());
-            const hardStopped =
-              latestMeta.pauseReason === "http_401" ||
-              latestMeta.pauseReason === "http_403" ||
-              (latestMeta.pauseReason === "http_429" && (latestMeta.pausedUntil ?? Number.POSITIVE_INFINITY) > Date.now());
-            if (
-              !latestSettings.enabled ||
-              !latestSettings.delayedAutoBlock ||
-              latestViewer !== owner ||
-              !stillPresent ||
-              hardStopped ||
-              !latestRate.allowed ||
-              (latestMeta.nextRunAt ?? 0) > Date.now()
-            ) {
+            if (!(await canRunDelayedTarget(next.targetKey, owner, true))) {
               await abortableSleep(1_000, signal);
               continue;
             }
@@ -531,28 +521,9 @@ export default defineContentScript({
             const { performXAction } = await import("../lib/x-action");
             const attempt = await performXAction("block", next.userId, next.handle, {
               signal,
-              shouldProceed: async () => {
-                const [finalSettings, finalRecords, finalMeta] = await Promise.all([
-                  getSettings(),
-                  getBlocklist(),
-                  getDelayedBlockMeta(),
-                ]);
-                const finalViewer = viewerHandle()?.toLowerCase();
-                const finalHardStop =
-                  finalMeta.pauseReason === "http_401" ||
-                  finalMeta.pauseReason === "http_403" ||
-                  (finalMeta.pauseReason === "http_429" &&
-                    (finalMeta.pausedUntil ?? Number.POSITIVE_INFINITY) > Date.now());
-                return (
-                  finalSettings.enabled &&
-                  finalSettings.delayedAutoBlock &&
-                  finalViewer === owner &&
-                  finalRecords.some(
-                    (record) => delayedBlockTargetForRecord(record)?.key === next.targetKey,
-                  ) &&
-                  !finalHardStop
-                );
-              },
+              // The request budget was reserved above, so this final gate only
+              // rechecks revocable inputs, not the now-incremented cap.
+              shouldProceed: () => canRunDelayedTarget(next.targetKey, owner, false),
             });
             if (attempt.aborted || signal.aborted) {
               await recoverProcessingDelayedBlocks().catch(() => {});
@@ -561,13 +532,7 @@ export default defineContentScript({
             const settled = await settleDelayedBlockAttempt(next.targetKey, attempt, Date.now());
             const after = Date.now();
             if (settled?.stop) {
-              await updateDelayedBlockMeta({
-                pauseReason: settled.stop.reason,
-                pausedAt: after,
-                pausedUntil: settled.stop.until,
-                nextRunAt: settled.stop.until,
-                lastRunnerAt: after,
-              });
+              await setDelayedBlockPause(settled.stop.reason, after, settled.stop.until);
               if (settled.stop.reason === "http_401" || settled.stop.reason === "http_403") return;
               continue;
             }
@@ -581,15 +546,13 @@ export default defineContentScript({
           } catch (error) {
             if (signal.aborted || (error as { name?: string })?.name === "AbortError") throw error;
             await recoverProcessingDelayedBlocks().catch(() => {});
-            await updateDelayedBlockMeta({
-              pauseReason: "storage_error",
-              pausedAt: now,
-              pausedUntil: now + 5 * 60_000,
-              nextRunAt: now + 5 * 60_000,
-              lastRunnerAt: now,
-            }).catch(() => {});
+            await setDelayedBlockPause(
+              "storage_error",
+              now,
+              now + DELAYED_BLOCK_STORAGE_RETRY_MS,
+            ).catch(() => {});
             console.warn("[MXGA] 延迟拉黑本轮失败，5 分钟后重试", error);
-            await abortableSleep(5 * 60_000, signal);
+            await abortableSleep(DELAYED_BLOCK_STORAGE_RETRY_MS, signal);
           }
         }
       };

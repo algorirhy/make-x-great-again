@@ -35,6 +35,11 @@ otherwise.
 - HTTP 404 block responses are classified as unavailable targets instead of
   failures. They are not retried or redirected through handle fallback, and
   existing 404 states migrate automatically.
+- Delayed-block safety checks now share one hard-stop, pause and active-target
+  path; handle-to-ID upgrades cannot leave a stale handle action runnable, and
+  disabled/429 pause state stays consistent across the options page and runner.
+- Personal-fork documentation now separates the concise feature contract from
+  the optional store-to-sideload migration runbook.
 - Consolidated the macOS and iOS containers and Safari extensions into one Xcode project with
   four platform-specific targets; deployment baselines are now macOS 15 and iOS 18.
 - Safari's in-page blacklist index now retains compact lite rows and expands display data only
