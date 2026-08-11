@@ -87,7 +87,6 @@ export interface DelayedBlockSummary {
   failed: number;
   skipped: number;
   unavailable: number;
-  handleOnly: number;
   invalidTarget: number;
   hourAttempts: number;
   dayAttempts: number;
@@ -815,7 +814,6 @@ export function summarizeDelayedBlocks(
     failed: 0,
     skipped: 0,
     unavailable: 0,
-    handleOnly: targets.filter((target) => target && !target.userId).length,
     invalidTarget: targets.filter((target) => !target).length,
     hourAttempts: 0,
     dayAttempts: 0,

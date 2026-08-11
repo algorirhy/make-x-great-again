@@ -1731,12 +1731,11 @@ function Settings() {
                 </span>
               </div>
               {delayedSummary && (
-                <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-6">
+                <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-5">
                   <span>待处理 <b className="font-mono text-fg">{delayedSummary.pending + delayedSummary.retryWait}</b></span>
                   <span>已拉黑 <b className="font-mono text-ok">{delayedSummary.succeeded}</b></span>
                   <span>失败 <b className="font-mono text-danger">{delayedSummary.failed}</b></span>
                   <span>目标不可用 <b className="font-mono text-fg-3">{delayedSummary.unavailable}</b></span>
-                  <span>handle 兜底 <b className="font-mono text-fg">{delayedSummary.handleOnly}</b></span>
                   <span>24h 请求 <b className="font-mono text-fg">{delayedSummary.dayAttempts}/{DELAYED_BLOCK_DAILY_LIMIT}</b></span>
                 </div>
               )}
