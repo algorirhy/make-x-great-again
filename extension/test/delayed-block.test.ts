@@ -175,7 +175,7 @@ test("stored 404 failures are presented as unavailable before migration persists
 
 test("rolling hour/day request caps count attempts, not successes", () => {
   assert.equal(DELAYED_BLOCK_HOURLY_LIMIT, 60);
-  assert.equal(DELAYED_BLOCK_DAILY_LIMIT, 360);
+  assert.equal(DELAYED_BLOCK_DAILY_LIMIT, 720);
   const hour = Array.from(
     { length: DELAYED_BLOCK_HOURLY_LIMIT },
     (_, i) => NOW - 50 * 60_000 + i * 1_000,

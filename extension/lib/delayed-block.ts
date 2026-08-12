@@ -13,7 +13,7 @@ import type { XActionAttempt } from "./x-action";
 export const DELAYED_BLOCK_INTERVAL_MIN_MS = 45_000;
 export const DELAYED_BLOCK_INTERVAL_MAX_MS = 75_000;
 export const DELAYED_BLOCK_HOURLY_LIMIT = 60;
-export const DELAYED_BLOCK_DAILY_LIMIT = 360;
+export const DELAYED_BLOCK_DAILY_LIMIT = 720;
 
 const K_STATES = "xss:delayed-block:states:v2";
 const K_STATES_V1 = "xss:delayed-block:states:v1";
