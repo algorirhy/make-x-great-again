@@ -128,3 +128,17 @@ test("rows finishing after navigation still land in the session archive", () => 
   assert.match(pill().innerHTML, /已处理/);
   assert.match(pill().innerHTML, />3</, "archive holds A+B+C, not just A");
 });
+
+test("local auto-hide can complete without entering the native X queue", () => {
+  const bubble = createBubble(noopHandlers, "tr", "隐藏", { autoExpand: false });
+  const pill = () => pillOf(bubble);
+  const a = spam("alice", "1");
+
+  bubble.update([a]);
+  bubble.markAuto("1", "done", "隐藏");
+  bubble.pageReset();
+
+  assert.match(pill().innerHTML, /已处理/);
+  assert.match(pill().innerHTML, />1</);
+  assert.doesNotMatch(pill().innerHTML, /处理中|排队/);
+});

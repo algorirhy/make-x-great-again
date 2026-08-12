@@ -448,36 +448,6 @@ svg { display: block; }
   border-color: var(--warn); box-shadow: none;
   animation: xpulse 1.6s ease-in-out infinite;
 }
-/* v0.4 "拉黑中" in-place badge: solid danger pill breathing on the tweet
- * while the auto queue works it, with a spinner ring around the icon —
- * THIS is the visible "the extension is doing something" moment. */
-.xss-badge.acting {
-  --badge-color: var(--danger);
-  color: #fff; cursor: default; overflow: visible;
-  background: linear-gradient(180deg, color-mix(in srgb, var(--danger) 92%, #fff), var(--danger));
-  border-color: color-mix(in srgb, var(--danger) 90%, transparent);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--danger) 18%, transparent), 0 2px 9px color-mix(in srgb, var(--danger) 24%, transparent);
-  animation: xactpulse 1.25s ease-in-out infinite;
-}
-.xss-badge.acting .xss-ico {
-  position: relative; display: inline-flex; flex: none;
-}
-.xss-badge.acting .xss-ico::after {
-  content: ""; position: absolute; inset: -4px; border-radius: 999px;
-  border: 1.5px solid color-mix(in srgb, #fff 30%, transparent);
-  border-top-color: #fff; animation: xspin .72s linear infinite;
-}
-@keyframes xactpulse {
-  0%,100% { transform: translateY(0); filter: brightness(1); }
-  50% { transform: translateY(-1px); filter: brightness(1.1); }
-}
-/* Queued-for-auto badge — quiet outline, the row is waiting its turn. */
-.xss-badge.actqueued {
-  color: var(--danger); cursor: default;
-  background: color-mix(in srgb, var(--danger) 9%, transparent);
-  border-color: color-mix(in srgb, var(--danger) 45%, transparent);
-  box-shadow: none; animation: xpulse 1.8s ease-in-out infinite;
-}
 @keyframes xrise { from { opacity: 0; transform: translateY(4px); } }
 @keyframes xpop  { from { opacity: 0; transform: scale(.9); } }
 @keyframes xspin { to { transform: rotate(360deg); } }
@@ -514,8 +484,6 @@ svg { display: block; }
   .xss-badge.fresh, .xss-badge.known { animation: fade .18s ease-out; }
   .xss-badge.analyzing::after, .xss-spin { animation: none; }
   .xss-badge.pending { animation: none; opacity: .7; }
-  .xss-badge.acting, .xss-badge.acting .xss-ico::after,
-  .xss-badge.actqueued { animation: none; }
   .metric.tick, .m-plus { animation: none; }
   .m-plus { display: none; }
   .scan-radar.busy,
@@ -1607,19 +1575,6 @@ export function createBubble(
       autoExpand = v;
     },
   };
-}
-
-/** v0.4-style in-place auto-processing badge for the tweet row: a pulsing
- *  solid "拉黑中" pill with a spinner while the queue works this account,
- *  or a quiet "待拉黑" outline while it waits its turn. */
-export function createActingBadge(verb: string, queued = false): HTMLElement {
-  const el = document.createElement("span");
-  el.className = `xss-badge ${queued ? "actqueued" : "acting"}`;
-  el.setAttribute("aria-label", queued ? `等待自动${verb}` : `自动${verb}中`);
-  el.innerHTML = `<span class="xss-ico">${icon("shield-x", "currentColor", 12)}</span><span>${
-    queued ? `待${esc(verb)}` : `${esc(verb)}中`
-  }</span>`;
-  return el;
 }
 
 export interface BadgeActions {

@@ -57,7 +57,6 @@ import {
   type BadgeSource,
   type Finding,
   STYLE,
-  createActingBadge,
   createBadge,
   createBubble,
 } from "../lib/ui";
@@ -704,18 +703,14 @@ export default defineContentScript({
       });
     }
 
-    // ---- Visible auto-processing queue (the v0.4 爽感 path) ----
-    // Auto hits do NOT vanish silently: each account is queued and worked
-    // ONE AT A TIME — in-place pulsing "拉黑中" badge on the tweet, live
-    // queued→processing→done row states in the bubble (which auto-opens),
-    // then an animated collapse of the cell. The decision itself is recorded
-    // up-front, so only the theater is deferred, never the protection.
-    const AUTO_MIN_ACT_MS = 900; // every item is visibly "worked" this long
-    const AUTO_SETTLE_MS = 240; // beat between items (v0.4: 180ms)
-    // Roster-first: the page scan surfaces hits one by one, so the sweep
-    // waits out a short gather window — the bubble fills with 排队中 rows
-    // FIRST, then the cleanup walks through them. Capped so a trickle of
-    // late hits can't stall the start forever.
+    // ---- Native X auto-action queue ----
+    // Every automatic action hides the page surface immediately. Only native
+    // X mute/block requests enter this paced queue; a purely local hide has no
+    // network or X-risk reason to wait behind presentation timing.
+    const AUTO_MIN_ACT_MS = 900; // keep native-action progress legible
+    const AUTO_SETTLE_MS = 240; // beat between native actions
+    // Roster-first for native actions: briefly gather hits before the bubble
+    // walks through their remote requests. This never delays the page hide.
     const AUTO_GATHER_MS = 1600;
     const AUTO_GATHER_MAX_MS = 4000;
     const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -732,27 +727,10 @@ export default defineContentScript({
       tweetId?: string;
     }
     const autoQueue: AutoItem[] = [];
-    // Keys owned by the queue — step 0's insta-hide must spare the cell the
-    // animation is (about to be) playing on.
+    // Keys with an automatic action in progress. This prevents a recycled or
+    // concurrently scanned row from submitting the same native action twice.
     const autoActing = new Set<string>();
     let autoDraining = false;
-
-    function mountActing(anchor: HTMLElement, verb: string, queued: boolean) {
-      clearMounts(anchor);
-      mountBadge(anchor, () => createActingBadge(verb, queued));
-    }
-
-    /** X recycles article nodes: trust the captured anchor only while it
-     *  still renders this account, else fall back to the tagged row. */
-    function autoTarget(it: AutoItem): HTMLElement | null {
-      const art = articleOf(it.anchor);
-      const same =
-        !!art && handleFromArticle(art)?.toLowerCase() === it.sig.handle.toLowerCase();
-      if (same) return it.anchor;
-      return document.querySelector<HTMLElement>(
-        `[data-xss-key="${CSS.escape(it.key)}"]`,
-      );
-    }
 
     function enqueueAuto(it: AutoItem) {
       if (autoActing.has(it.key)) return;
@@ -801,7 +779,19 @@ export default defineContentScript({
       void bumpStat("blocked");
       anchorByKey.set(it.key, it.anchor);
       articleOf(it.anchor)?.setAttribute("data-xss-key", it.key);
-      mountActing(it.anchor, it.verb, true);
+
+      // Protection and presentation are independent: clean the page now,
+      // before any optional X request, animation dwell or queue wait.
+      hideAccountSurface(it.anchor);
+
+      if (it.action === "hide") {
+        bubbleApi?.markAuto(it.key, "done", it.verb);
+        autoActing.delete(it.key);
+        return;
+      }
+
+      // Only X-native mute/block actions reach this queue. Their local hide is
+      // already complete; the bubble continues to report remote progress.
       bubbleApi?.markAuto(it.key, "queued", it.verb);
       autoQueue.push(it);
       scheduleDrain();
@@ -845,8 +835,6 @@ export default defineContentScript({
         // rest of the queue — fail it and move on.
         try {
           const t0 = Date.now();
-          const acting = autoTarget(it);
-          if (acting) mountActing(acting, it.verb, false);
           bubbleApi?.markAuto(it.key, "processing", it.verb);
           const xOk =
             it.action === "mute" || it.action === "block"
@@ -854,14 +842,10 @@ export default defineContentScript({
               : true;
           if (!xOk)
             console.warn(`[MXGA] 自动${it.verb}：X 原生动作失败`, it.sig.handle, it.sig.userId);
-          // Even the instant local-hide mode dwells long enough to be SEEN.
+          // Keep the native-action progress state legible in the bubble. The
+          // actual page surface was already hidden before this queue started.
           const dwell = AUTO_MIN_ACT_MS - (Date.now() - t0);
           if (dwell > 0) await sleep(dwell);
-          // Hide the real tweet INSTANTLY — the processing theater (fade /
-          // shrink / fly-into-chip) belongs to the corner bubble; animating
-          // the page's own DOM competes with X's scroll/virtualizer and reads
-          // as jank on the timeline.
-          hideAccountSurface(autoTarget(it));
           // The action has now SETTLED (attempted) — drop its pending marker so
           // it stops being a resume candidate; only items whose queue died
           // before this point stay pending. On X failure, annotate the record.
@@ -1073,10 +1057,9 @@ export default defineContentScript({
         ...(badgeSource === "list" ? { tier: entry.tier } : {}),
       });
       const verb = action === "mute" ? "静音" : action === "block" ? "拉黑" : "隐藏";
-      // The visible queue owns everything from here: records up-front, then
-      // in-place badge → paced X action → animated collapse → bubble row
-      // states. The 处理记录 line is written after the X action settles so it
-      // can state honestly whether the native mute/block actually landed.
+      // The auto path records and hides locally at once. Native mute/block
+      // then continues through the paced background queue; local-only hides
+      // complete immediately without entering it.
       enqueueAuto({
         key,
         sig,
@@ -1099,10 +1082,9 @@ export default defineContentScript({
       if (inFlight.has(key)) return; // a concurrent scan is already on it
       inFlight.add(key);
       try {
-        // 0. Already blocked → hide, never render again. Exception: the cell
-        //    the visible auto queue is working on (it was recorded up-front)
-        //    — its animation owns the hide; OTHER cells by the same account
-        //    still vanish instantly.
+        // 0. Already blocked → hide, never render again. A cell whose native
+        //    X action is already queued needs no second submission; OTHER
+        //    cells by the same account still vanish instantly.
         // Check every id form the account may have been recorded under: the
         // same account can surface with a uid (fiber walk) or handle-only
         // (profile header), and a hit stored under one form must short-circuit
