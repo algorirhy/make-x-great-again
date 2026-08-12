@@ -98,6 +98,7 @@ const DELAYED_PAUSE_ZH: Record<string, string> = {
   idle: "队列为空",
   disabled: "功能已关闭",
   not_logged_in: "等待登录 X",
+  owner_missing: "未绑定执行账号，请关闭后重新开启",
   account_mismatch: "当前 X 账号与绑定账号不一致",
   hourly_limit: "已达到每小时上限",
   daily_limit: "已达到 24 小时上限",

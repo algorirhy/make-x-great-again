@@ -12,9 +12,8 @@ otherwise.
 
 - Opt-in delayed X blocking for explicit local-hide records in the personal
   Chrome build: persistent success dedupe, viewer-handle binding, cross-tab
-  serialization, randomized 45–75 second pacing, rolling 60/hour and 360/day
-  request caps,
-  and hard stops on 401/403/429. Numeric user IDs are preferred, with a
+  serialization, randomized 45–75 second pacing, rolling 60/hour and 720/day
+  request caps, and hard stops on 401/403/429. Numeric user IDs are preferred, with a
   validated handle fallback for records where X did not expose the ID. Known
   mutes and safety-capped auto-tier hides are excluded; ambiguous legacy rows
   are included by design.
@@ -38,6 +37,10 @@ otherwise.
 - Delayed-block safety checks now share one hard-stop, pause and active-target
   path; handle-to-ID upgrades cannot leave a stale handle action runnable, and
   disabled/429 pause state stays consistent across the options page and runner.
+- Delayed attempts settle only while their target is still processing, so a
+  concurrent foreground success cannot be overwritten. Missing owner bindings
+  now fail closed, malformed stored states are ignored, and non-retryable 4xx
+  foreground failures no longer enter the retry queue.
 - Personal-fork documentation now separates the concise feature contract from
   the optional store-to-sideload migration runbook.
 - Delayed-block summary cards no longer expose the internal handle-fallback

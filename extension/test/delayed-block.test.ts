@@ -285,6 +285,34 @@ test("persistent state transitions dedupe success and stop on auth/rate errors",
   };
 
   try {
+    memory["xss:delayed-block:states:v2"] = {
+      malformedTarget: {
+        targetKey: 7,
+        handle: 5,
+        status: "pending",
+        origin: "local_hide",
+      },
+      malformedStatus: {
+        targetKey: "320",
+        handle: "bad",
+        status: "unknown",
+        origin: "local_hide",
+      },
+      "321": {
+        targetKey: "321",
+        handle: "Safe_Target",
+        status: "pending",
+        origin: "local_hide",
+        attempts: -2.8,
+        updatedAt: NOW,
+      },
+    };
+    const sanitized = await getDelayedBlockStates();
+    assert.deepEqual(Object.keys(sanitized), ["321"]);
+    assert.equal(sanitized["321"]?.attempts, 0);
+    assert.equal(sanitized["321"]?.createdAt, NOW);
+    delete memory["xss:delayed-block:states:v2"];
+
     memory["xss:delayed-block:states:v1"] = {
       "776": {
         userId: "776",
@@ -355,6 +383,27 @@ test("persistent state transitions dedupe success and stop on auth/rate errors",
       NOW + 4,
     );
     assert.equal((await getDelayedBlockStates())["123"]?.status, "succeeded");
+
+    // Only retryable/auth/rate failures enter the delayed retry path. Other
+    // client errors are terminal, matching delayed-attempt settlement.
+    await recordDirectBlockResult("400", "bad-request", { ok: false, status: 400 }, NOW + 5);
+    assert.equal((await getDelayedBlockStates())["400"]?.status, "failed");
+    await recordDirectBlockResult(
+      "429",
+      "rate-limited",
+      { ok: false, status: 429, retryable: true, retryAfterMs: 1_000 },
+      NOW + 5,
+    );
+    const directRate = (await getDelayedBlockStates())["429"];
+    assert.equal(directRate?.status, "retry_wait");
+    assert.equal(directRate?.nextRetryAt, NOW + 5 + 60 * 60_000);
+    await recordDirectBlockResult(
+      "500",
+      "network-error",
+      { ok: false, retryable: true },
+      NOW + 5,
+    );
+    assert.equal((await getDelayedBlockStates())["500"]?.status, "pending");
 
     // A handle-only success is reused if a later record discovers the
     // immutable userId, preventing a duplicate POST for the same handle.
@@ -440,6 +489,29 @@ test("persistent state transitions dedupe success and stop on auth/rate errors",
     );
     assert.equal(unavailableSummary.unavailable, 1);
     assert.equal(unavailableSummary.failed, 0);
+
+    // A foreground success can settle while a delayed action is waiting in
+    // the shared X-action lock. The stale delayed result must not downgrade it.
+    await ensureDelayedStatesForRecords([
+      record({
+        id: "458",
+        handle: "concurrent",
+        requestedAction: "hide",
+        effectiveAction: "hide",
+        delayedBlockEligible: true,
+      }),
+    ], NOW + 15);
+    await markDelayedBlockProcessing("458", NOW + 16);
+    await recordDirectBlockResult("458", "concurrent", { ok: true, status: 200 }, NOW + 17);
+    assert.equal(
+      await settleDelayedBlockAttempt(
+        "458",
+        { ok: false, status: 503, retryable: true },
+        NOW + 18,
+      ),
+      null,
+    );
+    assert.equal((await getDelayedBlockStates())["458"]?.status, "succeeded");
 
     // Use a fresh target for 429 so the success ledger is never downgraded.
     await ensureDelayedStatesForRecords([

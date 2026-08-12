@@ -9,6 +9,7 @@ import {
   enqueueDelayedBlock,
   ensureDelayedStatesForRecords,
   getDelayedBlockMeta,
+  getDelayedBlockStates,
   hasActiveDelayedBlockTarget,
   isDelayedBlockHardStopped,
   markDelayedBlockProcessing,
@@ -125,24 +126,26 @@ function runnerWaitMs(now: number, until?: number): number {
 async function canRunDelayedTarget(
   targetKey: string,
   ownerHandle: string,
-  checkSchedule: boolean,
+  options: { checkSchedule: boolean; requireProcessing?: boolean },
 ): Promise<boolean> {
   const now = Date.now();
-  const [liveSettings, records, meta] = await Promise.all([
+  const [liveSettings, records, meta, states] = await Promise.all([
     getSettings(),
     getBlocklist(),
     getDelayedBlockMeta(),
+    getDelayedBlockStates(),
   ]);
   if (
     !delayedBlockEnabled(liveSettings) ||
     normalizeDelayedBlockHandle(liveSettings.delayedBlockOwnerHandle) !== ownerHandle ||
     normalizeDelayedBlockHandle(viewerHandle()) !== ownerHandle ||
     !hasActiveDelayedBlockTarget(records, targetKey) ||
+    (options.requireProcessing && states[targetKey]?.status !== "processing") ||
     isDelayedBlockHardStopped(meta, now)
   ) {
     return false;
   }
-  if (!checkSchedule) return true;
+  if (!options.checkSchedule) return true;
   return (
     (meta.nextRunAt ?? 0) <= now &&
     delayedBlockRateDecision(meta.attemptTimestamps, now).allowed
@@ -439,18 +442,19 @@ export default defineContentScript({
             }
 
             const currentViewer = normalizeDelayedBlockHandle(viewerHandle());
-            let owner = normalizeDelayedBlockHandle(liveSettings.delayedBlockOwnerHandle);
+            const owner = normalizeDelayedBlockHandle(liveSettings.delayedBlockOwnerHandle);
             if (!currentViewer) {
               await setDelayedBlockPause("not_logged_in", now);
               await abortableSleep(DELAYED_BLOCK_POLL_MS, signal);
               continue;
             }
-            // Backward-safe fallback for a setting imported/enabled without
-            // going through the options-page switch. Normal enables bind in
-            // the click handler, where the permission prompt is user-driven.
             if (!owner) {
-              await setSetting("delayedBlockOwnerHandle", currentViewer);
-              owner = currentViewer;
+              // Fail closed when settings were imported or partially written.
+              // Only the explicit options-page enable flow may bind an X
+              // account; a content tab must never choose one implicitly.
+              await setDelayedBlockPause("owner_missing", now);
+              await abortableSleep(DELAYED_BLOCK_POLL_MS, signal);
+              continue;
             }
             if (currentViewer !== owner) {
               await setDelayedBlockPause("account_mismatch", now);
@@ -503,7 +507,11 @@ export default defineContentScript({
             // Re-read all safety inputs immediately before committing the
             // attempt: the user may have restored the row, disabled the
             // switch, or changed X accounts while this tab was waiting.
-            if (!(await canRunDelayedTarget(next.targetKey, owner, true))) {
+            if (
+              !(await canRunDelayedTarget(next.targetKey, owner, {
+                checkSchedule: true,
+              }))
+            ) {
               await abortableSleep(1_000, signal);
               continue;
             }
@@ -522,7 +530,11 @@ export default defineContentScript({
               signal,
               // The request budget was reserved above, so this final gate only
               // rechecks revocable inputs, not the now-incremented cap.
-              shouldProceed: () => canRunDelayedTarget(next.targetKey, owner, false),
+              shouldProceed: () =>
+                canRunDelayedTarget(next.targetKey, owner, {
+                  checkSchedule: false,
+                  requireProcessing: true,
+                }),
             });
             if (attempt.aborted || signal.aborted) {
               await recoverProcessingDelayedBlocks().catch(() => {});

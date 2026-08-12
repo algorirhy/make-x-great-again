@@ -40,6 +40,7 @@ export type DelayedBlockPauseReason =
   | "idle"
   | "disabled"
   | "not_logged_in"
+  | "owner_missing"
   | "account_mismatch"
   | "hourly_limit"
   | "daily_limit"
@@ -150,6 +151,30 @@ export interface DelayedBlockTarget {
   userId?: string;
 }
 
+const DELAYED_BLOCK_STATUSES = new Set<DelayedBlockStatus>([
+  "pending",
+  "processing",
+  "succeeded",
+  "retry_wait",
+  "failed",
+  "skipped",
+]);
+const DELAYED_BLOCK_ORIGINS = new Set<DelayedBlockOrigin>([
+  "local_hide",
+  "direct_block_retry",
+  "legacy",
+]);
+const DELAYED_BLOCK_SKIP_REASONS = new Set<DelayedBlockSkipReason>([
+  "mute",
+  "policy_cap",
+  "superseded",
+  "target_unavailable",
+]);
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
 /** Prefer X's immutable numeric id; fall back to its validated screen_name. */
 export function delayedBlockTarget(
   userId: string | undefined,
@@ -181,20 +206,50 @@ function normalizeStoredStates(raw: unknown): DelayedBlockStates {
   const normalized: DelayedBlockStates = {};
   for (const [storedKey, value] of Object.entries(raw)) {
     if (!value || typeof value !== "object" || Array.isArray(value)) continue;
-    const state = value as Partial<DelayedBlockState> & { userId?: string };
-    const legacyTarget = state.targetKey ?? state.userId ?? storedKey;
+    const state = value as Record<string, unknown>;
+    const storedTargetKey = typeof state.targetKey === "string" ? state.targetKey : undefined;
+    const storedUserId = typeof state.userId === "string" ? state.userId : undefined;
+    const storedHandle = typeof state.handle === "string" ? state.handle : undefined;
+    const legacyTarget = storedTargetKey ?? storedUserId ?? storedKey;
     const target = delayedBlockTarget(
-      isNumericUserId(legacyTarget) ? legacyTarget : state.userId,
-      state.handle ?? (legacyTarget.startsWith("h:") ? legacyTarget.slice(2) : undefined),
+      isNumericUserId(legacyTarget) ? legacyTarget : storedUserId,
+      storedHandle ?? (legacyTarget.startsWith("h:") ? legacyTarget.slice(2) : undefined),
     );
-    if (!target || typeof state.status !== "string" || typeof state.origin !== "string") continue;
-    const next = {
-      ...state,
+    const status = state.status;
+    const origin = state.origin;
+    if (
+      !target ||
+      typeof status !== "string" ||
+      !DELAYED_BLOCK_STATUSES.has(status as DelayedBlockStatus) ||
+      typeof origin !== "string" ||
+      !DELAYED_BLOCK_ORIGINS.has(origin as DelayedBlockOrigin)
+    ) {
+      continue;
+    }
+    const createdAt = finiteNumber(state.createdAt) ?? finiteNumber(state.updatedAt) ?? 0;
+    const next: DelayedBlockState = {
       targetKey: target.key,
       handle: target.handle,
+      status: status as DelayedBlockStatus,
+      origin: origin as DelayedBlockOrigin,
+      attempts: Math.max(0, Math.floor(finiteNumber(state.attempts) ?? 0)),
+      createdAt,
+      updatedAt: finiteNumber(state.updatedAt) ?? createdAt,
       ...(target.userId ? { userId: target.userId } : {}),
-    } as DelayedBlockState;
-    if (!target.userId) delete next.userId;
+    };
+    const blockedAt = finiteNumber(state.blockedAt);
+    const nextRetryAt = finiteNumber(state.nextRetryAt);
+    const lastHttpStatus = finiteNumber(state.lastHttpStatus);
+    if (blockedAt !== undefined) next.blockedAt = blockedAt;
+    if (nextRetryAt !== undefined) next.nextRetryAt = nextRetryAt;
+    if (lastHttpStatus !== undefined) next.lastHttpStatus = lastHttpStatus;
+    if (typeof state.lastError === "string") next.lastError = state.lastError;
+    if (
+      typeof state.skipReason === "string" &&
+      DELAYED_BLOCK_SKIP_REASONS.has(state.skipReason as DelayedBlockSkipReason)
+    ) {
+      next.skipReason = state.skipReason as DelayedBlockSkipReason;
+    }
     normalized[target.key] = next;
   }
   return normalized;
@@ -550,15 +605,30 @@ export async function recordDirectBlockResult(
       );
       return;
     }
-    states[target.key] = retargetState(current, target, {
+    const failed = retargetState(current, target, {
       origin: "direct_block_retry",
-      status: "pending",
       updatedAt: now,
       lastHttpStatus: attempt.status,
       lastError: attempt.status ? `HTTP ${attempt.status}` : "network_error",
-      nextRetryAt: undefined,
-      skipReason: undefined,
     });
+    delete failed.blockedAt;
+    delete failed.nextRetryAt;
+    delete failed.skipReason;
+    if (attempt.status === 401 || attempt.status === 403) {
+      failed.status = "retry_wait";
+    } else if (attempt.status === 429) {
+      failed.status = "retry_wait";
+      failed.nextRetryAt = now + Math.max(60 * 60_000, attempt.retryAfterMs ?? 0);
+    } else if (
+      attempt.status !== undefined &&
+      attempt.status >= 400 &&
+      attempt.status < 500
+    ) {
+      failed.status = "failed";
+    } else {
+      failed.status = "pending";
+    }
+    states[target.key] = failed;
   });
 }
 
@@ -623,7 +693,10 @@ export async function settleDelayedBlockAttempt(
 ): Promise<DelayedAttemptSettlement | null> {
   return mutateStates((states) => {
     const state = states[targetKey];
-    if (!state) return null;
+    // A foreground block may have settled this target while the delayed
+    // request was waiting in the shared X-action lock. Never let the older
+    // delayed result overwrite that newer terminal truth.
+    if (!state || state.status !== "processing") return null;
     state.updatedAt = now;
     state.lastHttpStatus = attempt.status;
 
