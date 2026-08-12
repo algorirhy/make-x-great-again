@@ -16,6 +16,7 @@ import {
   isDelayedBlockHardStopped,
   markDelayedBlockProcessing,
   randomDelayedBlockInterval,
+  reconcileDelayedBlockRatePause,
   recordDelayedBlockAttempt,
   recordDirectBlockResult,
   selectNextDelayedBlock,
@@ -196,6 +197,30 @@ test("rolling hour/day request caps count attempts, not successes", () => {
   assert.equal(dayDecision.reason, "daily_limit");
 
   assert.equal(delayedBlockRateDecision([], NOW).allowed, true);
+});
+
+test("a persisted rate pause is reconciled when a newer build changes the cap", () => {
+  const oldDailyBudget = Array.from(
+    { length: 360 },
+    (_, i) => NOW - 23 * 60 * 60_000 + i * 2 * 60_000,
+  );
+  const stale = {
+    attemptTimestamps: oldDailyBudget,
+    pauseReason: "daily_limit" as const,
+    pausedAt: NOW - 1_000,
+    pausedUntil: NOW + 60 * 60_000,
+    nextRunAt: NOW + 60 * 60_000,
+  };
+
+  const reconciled = reconcileDelayedBlockRatePause(stale, NOW);
+  assert.equal(reconciled.pauseReason, undefined);
+  assert.equal(reconciled.pausedUntil, undefined);
+  assert.equal(reconciled.nextRunAt, undefined);
+
+  const summary = summarizeDelayedBlocks([], {}, stale, NOW);
+  assert.equal(summary.dayAttempts, 360);
+  assert.equal(summary.pauseReason, undefined);
+  assert.equal(summary.nextRunAt, undefined);
 });
 
 test("hard stops distinguish active and expired cooldowns", () => {

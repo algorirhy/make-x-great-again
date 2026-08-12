@@ -210,12 +210,12 @@ export async function getDelayedBlockStates(): Promise<DelayedBlockStates> {
 
 export async function getDelayedBlockMeta(): Promise<DelayedBlockMeta> {
   const raw = await getLocal<Partial<DelayedBlockMeta> | null>(K_META, null);
-  return {
+  return reconcileDelayedBlockRatePause({
     ...(raw ?? {}),
     attemptTimestamps: Array.isArray(raw?.attemptTimestamps)
       ? raw.attemptTimestamps.filter((ts): ts is number => typeof ts === "number")
       : [],
-  };
+  });
 }
 
 async function mutateStates<T>(
@@ -725,6 +725,38 @@ export function delayedBlockRateDecision(
 }
 
 /**
+ * Re-evaluate a persisted hour/day pause against the current limits.
+ *
+ * Limit values can change between extension builds. A stored `nextRunAt`
+ * from the previous limit must not keep the worker asleep after the current
+ * budget allows requests again. Non-rate pauses and normal inter-request
+ * schedules are left untouched.
+ */
+export function reconcileDelayedBlockRatePause(
+  meta: DelayedBlockMeta,
+  now = Date.now(),
+): DelayedBlockMeta {
+  if (meta.pauseReason !== "hourly_limit" && meta.pauseReason !== "daily_limit") {
+    return meta;
+  }
+  const rate = delayedBlockRateDecision(meta.attemptTimestamps, now);
+  if (rate.allowed) {
+    const next = { ...meta };
+    delete next.pauseReason;
+    delete next.pausedAt;
+    delete next.pausedUntil;
+    delete next.nextRunAt;
+    return next;
+  }
+  return {
+    ...meta,
+    pauseReason: rate.reason,
+    pausedUntil: rate.nextAt,
+    nextRunAt: rate.nextAt,
+  };
+}
+
+/**
  * Atomically reserve one request from the rolling budget.
  *
  * Returning null means another action established a hard stop / cooldown
@@ -803,6 +835,7 @@ export function summarizeDelayedBlocks(
   meta: DelayedBlockMeta,
   now = Date.now(),
 ): DelayedBlockSummary {
+  meta = reconcileDelayedBlockRatePause(meta, now);
   const preferred = preferredRecordTargets(records);
   const activeIds = new Set(preferred.map(({ target }) => target.key));
   const targets = records.map(delayedBlockTargetForRecord);
