@@ -113,7 +113,7 @@ Wrangler 4 · @cloudflare/workers-types · @types/chrome。
   `review_log`、`publications`。状态机：auto_pending_review → human_confirmed
   / rejected / removed。`/v1/check` 只返回 human_confirmed。
 - **chrome.storage.local**：`xss:v1:*` 账号判定缓存、`xss:blocklist:v2`
-  隐藏记录（兼容旧 `xss:blocked` 迁移）、`xss:stats` 统计、
+  隐藏记录、`xss:blocked` 本地隐藏快速索引（两者由后台单写入器同步）、`xss:stats` 统计、
   `xss:settings`（enabled / bubble / bubblePos / edgeBase，edgeBase
   仅用于公榜站点链接）。v0.5.0 已移除 `xss:blockQueue` 与
   `xss:ghToken/ghLogin/ghClientId`。仅本机、无 PII。

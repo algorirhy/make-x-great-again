@@ -26,6 +26,13 @@ otherwise.
 
 ### Changed
 
+- Fixed a local-history race that could leave an account in `xss:blocked`
+  without its `xss:blocklist:v2` audit row: all hide/record mutations now use
+  one background-owned serialized writer and commit both keys together.
+  Existing orphaned ids are reconstructed on read, become eligible for the
+  documented legacy delayed-block policy when their target is valid, and
+  invalid targets are exposed in the settings summary instead of silently
+  disappearing behind “待处理 0”.
 - Legacy rows labeled as automatic blocks are queued instead of being treated
   as confirmed successes: older builds wrote that label before X acknowledged
   the request. Existing zero-attempt legacy success markers are requeued once.

@@ -1,15 +1,21 @@
-// Single typed accessor over chrome.storage.local. Backward-safe: a legacy
-// string[] blocklist auto-migrates to records on first read. All local, no
-// PII beyond the public numeric id (governance unchanged).
-import { removeBlocked } from "./blocklist";
-import type { Verdict } from "./types";
+// Typed client for local audit data. The background worker owns mutations of
+// the coupled hidden-id set + record list so concurrent X tabs cannot clobber
+// each other's read-modify-write updates.
+import type { BgRequest, BgResponse, Verdict } from "./types";
 
 // "manual"    → user clicked 隐藏 on a badge / bubble
 // "auto"      → per-category action policy fired on a public-blacklist hit
+// "recovered" → xss:blocked survived but its older audit row was missing
 // "list_hit"  → public-blacklist match (step 2 of content.ts)
 // "cache_hit" → local cache says this account is spam (step 1 of content.ts)
 // (Legacy sources from the auto-block era are kept for old stored records.)
-export type BlockSource = "manual" | "auto" | "block_all" | "list_hit" | "cache_hit";
+export type BlockSource =
+  | "manual"
+  | "auto"
+  | "recovered"
+  | "block_all"
+  | "list_hit"
+  | "cache_hit";
 
 /** Structured action audit for records written by v0.5.1+.
  *
@@ -72,8 +78,6 @@ export interface Stats {
   byLabel: Record<string, number>;
 }
 
-const K_BLOCK = "xss:blocklist:v2";
-const K_BLOCK_LEGACY = "xss:blocked";
 const K_STATS = "xss:stats";
 const K_PENDING = "xss:pending-actions";
 
@@ -93,44 +97,26 @@ async function set(key: string, val: unknown): Promise<void> {
   }
 }
 
-export async function getBlocklist(): Promise<BlockRecord[]> {
-  const v2 = await get<BlockRecord[] | null>(K_BLOCK, null);
-  if (v2) return v2;
-  // migrate legacy string[] of ids
-  const legacy = await get<string[]>(K_BLOCK_LEGACY, []);
-  const migrated: BlockRecord[] = legacy.map((id) => ({
-    id,
-    handle: id.startsWith("h:") ? id.slice(2) : id,
-    source: "manual",
-    ts: Date.now(),
-  }));
-  if (migrated.length) await set(K_BLOCK, migrated);
-  return migrated;
+async function blockRecordRequest<T>(message: BgRequest): Promise<T> {
+  const response = (await chrome.runtime.sendMessage(message)) as BgResponse;
+  if (!response?.ok) throw new Error(response?.error ?? "本地处理记录操作失败");
+  return response.data as T;
 }
 
-export async function addBlockRecord(rec: BlockRecord): Promise<void> {
-  const list = await getBlocklist();
-  if (list.some((r) => r.id === rec.id)) return;
-  list.push(rec);
-  await set(K_BLOCK, list);
+export function getBlocklist(): Promise<BlockRecord[]> {
+  return blockRecordRequest<BlockRecord[]>({ type: "block-records-get" });
 }
 
-export async function updateBlockRecord(
+/** Atomically persist the audit row and its local-hide id. */
+export function addBlockRecord(rec: BlockRecord): Promise<boolean> {
+  return blockRecordRequest<boolean>({ type: "block-record-add", record: rec });
+}
+
+export function updateBlockRecord(
   id: string,
   patch: Partial<Omit<BlockRecord, "id">>,
-): Promise<void> {
-  const list = await getBlocklist();
-  const i = list.findIndex((r) => r.id === id);
-  const rec = list[i];
-  if (!rec) return;
-  const merged: BlockRecord = { ...rec, ...patch };
-  // A patch value of undefined means "clear this field" (e.g. settling
-  // pendingAction) — drop the key rather than persisting an undefined.
-  for (const k of Object.keys(patch) as (keyof typeof patch)[]) {
-    if (patch[k] === undefined) delete merged[k];
-  }
-  list[i] = merged;
-  await set(K_BLOCK, list);
+): Promise<boolean> {
+  return blockRecordRequest<boolean>({ type: "block-record-update", id, patch });
 }
 
 // Serialize read-modify-write on the pending-actions key. A page can enqueue
@@ -168,14 +154,7 @@ export async function clearPendingAction(id: string): Promise<void> {
 }
 
 export async function removeBlock(id: string): Promise<void> {
-  const list = await getBlocklist();
-  await set(
-    K_BLOCK,
-    list.filter((r) => r.id !== id),
-  );
-  // Also reconcile the fast-path id set (xss:blocked) that content.ts hides
-  // by — otherwise un-hiding never takes effect on X pages.
-  await removeBlocked(id);
+  await blockRecordRequest<boolean>({ type: "block-record-remove", id });
 }
 
 export async function blockedIdSet(): Promise<Set<string>> {

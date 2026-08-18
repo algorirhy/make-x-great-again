@@ -41,24 +41,3 @@ export function isBlockedSync(id: string): boolean {
 export async function warm(): Promise<void> {
   await load();
 }
-
-export async function addBlocked(id: string): Promise<void> {
-  const s = await load();
-  if (s.has(id)) return;
-  s.add(id);
-  try {
-    await chrome.storage.local.set({ [KEY]: [...s] });
-  } catch {
-    /* non-fatal */
-  }
-}
-
-export async function removeBlocked(id: string): Promise<void> {
-  const s = await load();
-  if (!s.delete(id)) return;
-  try {
-    await chrome.storage.local.set({ [KEY]: [...s] });
-  } catch {
-    /* non-fatal */
-  }
-}

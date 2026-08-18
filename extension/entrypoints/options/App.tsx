@@ -655,6 +655,10 @@ function Blocklist() {
       label: "自动处理",
       hint: "命中公共黑名单或官方规则，按「设置 → 自动处理策略」自动执行",
     },
+    recovered: {
+      label: "自动修复",
+      hint: "旧版并发写入或历史迁移只留下了本地隐藏 ID，现已重建处理记录",
+    },
     block_all: { label: "一键处理", hint: "在气泡面板一键处理了本页全部命中（旧版记录）" },
     list_hit: { label: "名单命中", hint: "命中公共黑名单（旧版记录）" },
     cache_hit: { label: "缓存命中", hint: "命中本地检测缓存（旧版记录）" },
@@ -1732,11 +1736,13 @@ function Settings() {
                 </span>
               </div>
               {delayedSummary && (
-                <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-5">
-                  <span>待处理 <b className="font-mono text-fg">{delayedSummary.pending + delayedSummary.retryWait}</b></span>
+                <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+                  <span>待/处理中 <b className="font-mono text-fg">{delayedSummary.pending + delayedSummary.retryWait + delayedSummary.processing}</b></span>
                   <span>已拉黑 <b className="font-mono text-ok">{delayedSummary.succeeded}</b></span>
                   <span>失败 <b className="font-mono text-danger">{delayedSummary.failed}</b></span>
                   <span>目标不可用 <b className="font-mono text-fg-3">{delayedSummary.unavailable}</b></span>
+                  <span>策略跳过 <b className="font-mono text-fg-3">{Math.max(0, delayedSummary.skipped - delayedSummary.unavailable)}</b></span>
+                  <span>无法处理 <b className="font-mono text-danger">{delayedSummary.invalidTarget}</b></span>
                   <span>24h 请求 <b className="font-mono text-fg">{delayedSummary.dayAttempts}/{DELAYED_BLOCK_DAILY_LIMIT}</b></span>
                 </div>
               )}

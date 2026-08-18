@@ -107,6 +107,21 @@ export default defineBackground(() => {
           } else if (msg.type === "open_options") {
             chrome.runtime.openOptionsPage();
             sendResponse({ ok: true });
+          } else if (msg.type === "block-records-get") {
+            const { getStoredBlockRecords } = await import("../lib/block-record-storage");
+            sendResponse({ ok: true, data: await getStoredBlockRecords() });
+          } else if (msg.type === "block-record-add") {
+            const { addStoredBlockRecord } = await import("../lib/block-record-storage");
+            sendResponse({ ok: true, data: await addStoredBlockRecord(msg.record) });
+          } else if (msg.type === "block-record-update") {
+            const { updateStoredBlockRecord } = await import("../lib/block-record-storage");
+            sendResponse({
+              ok: true,
+              data: await updateStoredBlockRecord(msg.id, msg.patch),
+            });
+          } else if (msg.type === "block-record-remove") {
+            const { removeStoredBlockRecord } = await import("../lib/block-record-storage");
+            sendResponse({ ok: true, data: await removeStoredBlockRecord(msg.id) });
           } else if (msg.type === "report") {
             // Authenticated POST /v1/report from the SHARED extension origin
             // (same path the whitelist-apply flow uses), not the content

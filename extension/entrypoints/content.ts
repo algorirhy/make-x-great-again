@@ -1,6 +1,6 @@
 import { hideAccountSurface } from "../lib/account-surface";
 import { autoEligible, capAutoTierAction } from "../lib/auto-policy";
-import { addBlocked, isBlockedSync, warm as warmBlocklist } from "../lib/blocklist";
+import { isBlockedSync, warm as warmBlocklist } from "../lib/blocklist";
 import { BRAND } from "../lib/brand";
 import { type Cached, cacheGet, signalsHash } from "../lib/cache";
 import {
@@ -402,6 +402,12 @@ export default defineContentScript({
     // Warm local data structures
     await warmBlocklist();
     await warmLocalIndex();
+    // Reconcile older partial imports / raced writes before the local-hide
+    // short-circuit starts returning early for those accounts. The background
+    // single writer reconstructs any missing audit rows from xss:blocked.
+    await getBlocklist().catch((error) => {
+      console.warn("[MXGA] 本地处理记录修复失败，本次继续被动检测", error);
+    });
 
     const keyOf = (s: Signals) => s.userId || `h:${s.handle}`;
 
@@ -625,10 +631,9 @@ export default defineContentScript({
      *  from the bubble's batch panel). The local record + visual hide always
      *  happen (so the row stays gone across navigation); if the user opted
      *  into "mute"/"block", X's native action rides on top via the user's
-     *  own session (best-effort, paced). Everything up to the X call runs
-     *  synchronously; the returned promise resolves once the native action
-     *  settled (true = local-only mode or X action succeeded). */
-    function executeHide(key: string, sig: Signals): Promise<boolean> {
+     *  own session (best-effort, paced). The returned promise resolves once
+     *  the atomic local commit and optional native action have settled. */
+    async function executeHide(key: string, sig: Signals): Promise<boolean> {
       const pend = pendingActions.get(key);
       const mode = pend?.mode ?? settings.actionMode;
       // Triggering-tweet audit trail: prefer what scheduleHide captured live,
@@ -636,9 +641,7 @@ export default defineContentScript({
       const fin = findings.find((x) => (x.userId || `h:${x.handle}`) === key);
       const tweetId = pend?.tweetId ?? fin?.tweetId;
       const tweetText = pend?.tweetText ?? fin?.snippet;
-      void addBlocked(key);
-      if (sig.userId) void addBlocked(sig.userId);
-      void addBlockRecord({
+      const record = {
         id: key,
         handle: sig.handle,
         ...(sig.displayName ? { displayName: sig.displayName } : {}),
@@ -650,15 +653,10 @@ export default defineContentScript({
         delayedBlockEligible: mode === "local",
         source: "manual",
         ts: Date.now(),
-      });
-      if (mode === "local") {
-        void enqueueDelayedBlock(sig.userId, sig.handle).catch(() => {});
-      }
-      void bumpStats({ blocks: 1 });
-      void bumpStat("blocked");
+      } satisfies import("../lib/store").BlockRecord;
       // X recycles article nodes: only hide via the captured anchor if it
       // still belongs to this account; otherwise use the tagged row, else
-      // abort the DOM hide (the block itself is already recorded).
+      // abort the DOM hide (the durable commit follows immediately below).
       const anchor =
         pendingActions.get(key)?.anchor ?? anchorByKey.get(key) ?? null;
       const art = articleOf(anchor);
@@ -679,24 +677,30 @@ export default defineContentScript({
       // the 已处理 record — otherwise the row stalls at "待处理" forever and is
       // dropped on the next SPA navigation.
       bubbleApi?.markManual(key, actionVerb(mode));
+      // The background worker commits xss:blocked and xss:blocklist:v2 in one
+      // storage write. Do not start an X action until that recoverable local
+      // source of truth exists.
+      await addBlockRecord(record);
+      if (mode === "local") await enqueueDelayedBlock(sig.userId, sig.handle);
+      void bumpStats({ blocks: 1 });
+      void bumpStat("blocked");
       // Track the not-yet-fired X action so a mid-batch navigation/reload can
       // resume it rather than leave the account locally-hidden-only (same
       // guarantee as the auto queue). Local mode makes no X call — skip.
       if (mode === "mute" || mode === "block") {
-        void addPendingAction({ id: key, handle: sig.handle, action: mode, ts: Date.now() });
+        await addPendingAction({ id: key, handle: sig.handle, action: mode, ts: Date.now() });
       }
       // Mirror the auto path: when the native X action fails, the 处理记录
       // row must say so — the user clicked 拉黑/静音 and only got a local
       // hide, and the record is the one place that can state it honestly.
-      return applyXAction(mode, sig).then((ok) => {
-        if (mode === "mute" || mode === "block") void clearPendingAction(key);
-        if (!ok) {
-          void updateBlockRecord(key, {
-            reason: `手动${actionVerb(mode)}（X 动作失败，仅本地隐藏）`,
-          });
-        }
-        return ok;
-      });
+      const ok = await applyXAction(mode, sig);
+      if (mode === "mute" || mode === "block") await clearPendingAction(key);
+      if (!ok) {
+        await updateBlockRecord(key, {
+          reason: `手动${actionVerb(mode)}（X 动作失败，仅本地隐藏）`,
+        });
+      }
+      return ok;
     }
 
     function badgeForPending(anchor: HTMLElement, sig: Signals, mode?: ActionMode) {
@@ -747,66 +751,67 @@ export default defineContentScript({
     function enqueueAuto(it: AutoItem) {
       if (autoActing.has(it.key)) return;
       autoActing.add(it.key);
-      // Record FIRST — the protection survives navigation even if the
-      // animation never gets to play.
-      void addBlocked(it.key);
-      if (it.sig.userId) void addBlocked(it.sig.userId);
-      // The 处理记录 row too: the id lands in xss:blocked above, and a record
-      // is the only UI path back (恢复显示). Writing it after the paced X
-      // action left a window (tab close mid-queue) that produced permanently
-      // hidden accounts with no recover entry. The X-failure annotation is
-      // patched in later by the drain loop.
-      const tweetText = it.sig.triggeringComment || it.sig.recentTweets[0];
-      void addBlockRecord({
-        id: it.key,
-        handle: it.sig.handle,
-        ...(it.sig.displayName ? { displayName: it.sig.displayName } : {}),
-        ...(it.sig.avatarUrl ? { avatarUrl: it.sig.avatarUrl } : {}),
-        ...(it.tweetId ? { tweetId: it.tweetId } : {}),
-        ...(tweetText ? { tweetText } : {}),
-        verdict: it.verdict,
-        reason: `${it.categoryZh} · 自动${it.verb}`,
-        requestedAction: it.requestedAction,
-        effectiveAction: it.action as RecordedAction,
-        delayedBlockEligible: it.delayedBlockEligible,
-        source: "auto",
-        ts: Date.now(),
-      });
-      if (it.action === "hide" && it.delayedBlockEligible) {
-        void enqueueDelayedBlock(it.sig.userId, it.sig.handle).catch(() => {});
-      }
-      // Track the not-yet-fired X action separately (see PendingXAction): a
-      // mid-queue reload can then tell a queued account apart from a completed
-      // one — resuming it instead of falsely counting it as 已处理. Local-only
-      // hides need no X call, so nothing to track.
-      if (it.action === "mute" || it.action === "block") {
-        void addPendingAction({
-          id: it.key,
-          handle: it.sig.handle,
-          action: it.action,
-          ts: Date.now(),
-        });
-      }
-      void bumpStats({ blocks: 1 });
-      void bumpStat("blocked");
       anchorByKey.set(it.key, it.anchor);
       articleOf(it.anchor)?.setAttribute("data-xss-key", it.key);
 
       // Protection and presentation are independent: clean the page now,
-      // before any optional X request, animation dwell or queue wait.
+      // before storage, any optional X request, animation dwell or queue wait.
       hideAccountSurface(it.anchor);
 
-      if (it.action === "hide") {
-        bubbleApi?.markAuto(it.key, "done", it.verb);
-        autoActing.delete(it.key);
-        return;
-      }
+      void persistAuto(it);
+    }
 
-      // Only X-native mute/block actions reach this queue. Their local hide is
-      // already complete; the bubble continues to report remote progress.
-      bubbleApi?.markAuto(it.key, "queued", it.verb);
-      autoQueue.push(it);
-      scheduleDrain();
+    async function persistAuto(it: AutoItem) {
+      const tweetText = it.sig.triggeringComment || it.sig.recentTweets[0];
+      try {
+        // One background-owned mutation stores the record and local-hide id
+        // together. This is the durable source of truth for queue recovery.
+        await addBlockRecord({
+          id: it.key,
+          handle: it.sig.handle,
+          ...(it.sig.displayName ? { displayName: it.sig.displayName } : {}),
+          ...(it.sig.avatarUrl ? { avatarUrl: it.sig.avatarUrl } : {}),
+          ...(it.tweetId ? { tweetId: it.tweetId } : {}),
+          ...(tweetText ? { tweetText } : {}),
+          verdict: it.verdict,
+          reason: `${it.categoryZh} · 自动${it.verb}`,
+          requestedAction: it.requestedAction,
+          effectiveAction: it.action as RecordedAction,
+          delayedBlockEligible: it.delayedBlockEligible,
+          source: "auto",
+          ts: Date.now(),
+        });
+        if (it.action === "hide" && it.delayedBlockEligible) {
+          await enqueueDelayedBlock(it.sig.userId, it.sig.handle);
+        }
+        // Track the not-yet-fired X action only after the audit row exists.
+        if (it.action === "mute" || it.action === "block") {
+          await addPendingAction({
+            id: it.key,
+            handle: it.sig.handle,
+            action: it.action,
+            ts: Date.now(),
+          });
+        }
+        void bumpStats({ blocks: 1 });
+        void bumpStat("blocked");
+
+        if (it.action === "hide") {
+          bubbleApi?.markAuto(it.key, "done", it.verb);
+          autoActing.delete(it.key);
+          return;
+        }
+
+        // Only X-native mute/block actions reach this queue. Their local hide
+        // is already complete; the bubble reports the remote progress.
+        bubbleApi?.markAuto(it.key, "queued", it.verb);
+        autoQueue.push(it);
+        scheduleDrain();
+      } catch (error) {
+        console.warn("[MXGA] 自动处理记录持久化失败", it.sig.handle, error);
+        bubbleApi?.markAuto(it.key, "failed", it.verb);
+        autoActing.delete(it.key);
+      }
     }
 
     let drainTimer: ReturnType<typeof setTimeout> | undefined;
