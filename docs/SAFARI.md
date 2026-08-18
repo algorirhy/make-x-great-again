@@ -70,7 +70,7 @@ DEVELOPMENT_TEAM=<你的 Apple Team ID> INSTALL_APP=1 \
   ./scripts/build-safari-app.sh
 ```
 
-脚本会先拉取 `data-mirror` 分支上的最新 `data/blacklist/v2-lite.json`（离线或拉取失败时回退到本地 checkout 的副本，`--offline` 或 `MXGA_LIST_OFFLINE=1` 可强制离线），压缩为 Safari 的首屏/离线回退快照并生成 `.output/safari-mv3`，随后清理临时 public 文件并构建容器应用。后台同步成功后会热替换这份快照。产物位置固定为：
+脚本会先拉取 `data-mirror` 分支上的最新 `data/blacklist/v2-lite.json`，压缩为 Safari 的首屏/离线回退快照并生成 `.output/safari-mv3`，随后清理临时 public 文件并构建容器应用。拉取失败时会依次尝试当前 checkout 的数据文件以及本地 `data-mirror`、`origin/data-mirror`、`upstream/data-mirror` Git ref；`--offline` 或 `MXGA_LIST_OFFLINE=1` 会跳过网络，`MXGA_DATA_REF=<ref>` 可指定本地数据 ref。干净的 `main` 不再包含 JSON 快照，因此离线构建前至少需要获取一次 `data-mirror` ref。后台同步成功后会热替换打包快照。产物位置固定为：
 
 ```text
 .build/safari/Build/Products/Debug/MXGA.app

@@ -14,7 +14,7 @@ in [GOVERNANCE.md](./GOVERNANCE.md).
 
 | Source | Path / endpoint | Freshness |
 |---|---|---|
-| In-repo snapshot (audit) | [`data/blacklist/v1.json`](https://github.com/foru17/make-x-great-again/blob/data-mirror/data/blacklist/v1.json), [`data/whitelist/v1.json`](https://github.com/foru17/make-x-great-again/blob/data-mirror/data/whitelist/v1.json) — on the [`data-mirror`](https://github.com/foru17/make-x-great-again/tree/data-mirror/data) branch | mirrored from D1 every 6 hours (diff-aware; git history = audit log). Since 2026-08-03 the mirror writes to the dedicated `data-mirror` branch so automated data commits never race code work on `main`; the `data/` copy on `main` is a frozen snapshot from that date. |
+| In-repo snapshot (audit) | [`data/blacklist/v1.json`](https://github.com/foru17/make-x-great-again/blob/data-mirror/data/blacklist/v1.json), [`data/whitelist/v1.json`](https://github.com/foru17/make-x-great-again/blob/data-mirror/data/whitelist/v1.json) — on the [`data-mirror`](https://github.com/foru17/make-x-great-again/tree/data-mirror/data) branch | mirrored from D1 every 6 hours (diff-aware; git history = audit log). Since 2026-08-03 the mirror writes to the dedicated `data-mirror` branch so automated data commits never race code work on `main`; since 2026-08-14 `main/data` keeps only a pointer README, not a stale snapshot. |
 | Live API | `https://x.zuoluo.tv/v1/list` (paginated), `/v1/whitelist` | real-time, edge-cached |
 | Published artifacts (R2) | `https://x.zuoluo.tv/v1/list/meta` → `/v1/artifacts/<key>` | republished every 10 minutes; version changes only when content changes |
 
@@ -103,9 +103,9 @@ curl -sL https://raw.githubusercontent.com/foru17/make-x-great-again/data-mirror
 ```
 
 > **Branch note**: the live snapshot lives on the **`data-mirror`** branch
-> (updated every 6 hours). The `data/` directory on `main` stopped updating
-> on 2026-08-03 and is kept only as a frozen historical snapshot — don't
-> read it expecting fresh data.
+> (updated every 6 hours). The `data/` directory on `main` contains only a
+> pointer README; use the linked branch rather than expecting JSON files on
+> the code branch.
 
 > **Size warning**: `data/blacklist/v1.json` is currently ~18 MB and growing —
 > near jsDelivr's 20 MB per-file limit, so **do not rely on jsDelivr for the

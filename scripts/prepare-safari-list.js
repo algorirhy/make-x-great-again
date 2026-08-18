@@ -1,15 +1,17 @@
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-// The live snapshot lives on the data-mirror branch (main's data/ froze on
-// 2026-08-03), so prefer fetching it; the local checkout copy is the offline
-// fallback and may be stale.
+// The live snapshot lives on data-mirror; main intentionally contains only a
+// pointer README. Prefer the network artifact, then fall back to a local file
+// (when building from data-mirror) or an already-fetched local git ref.
 const remoteSource =
   process.env.MXGA_LIST_URL ??
   "https://raw.githubusercontent.com/foru17/make-x-great-again/data-mirror/data/blacklist/v2-lite.json";
 const localSource = path.join(root, "data/blacklist/v2-lite.json");
+const snapshotPath = "data/blacklist/v2-lite.json";
 const destination = path.join(root, "extension/public/blacklist-data.json");
 
 if (process.argv.includes("--clean")) {
@@ -18,11 +20,42 @@ if (process.argv.includes("--clean")) {
 }
 
 const offline = process.argv.includes("--offline") || process.env.MXGA_LIST_OFFLINE === "1";
+const localRefs = [
+  process.env.MXGA_DATA_REF,
+  "data-mirror",
+  "origin/data-mirror",
+  "upstream/data-mirror",
+].filter((ref, index, refs) => ref && refs.indexOf(ref) === index);
+
+function readLocalSnapshot() {
+  if (fs.existsSync(localSource)) {
+    return { raw: fs.readFileSync(localSource, "utf8"), source: localSource };
+  }
+  for (const ref of localRefs) {
+    try {
+      return {
+        raw: execFileSync("git", ["show", `${ref}:${snapshotPath}`], {
+          cwd: root,
+          encoding: "utf8",
+          maxBuffer: 64 * 1024 * 1024,
+          stdio: ["ignore", "pipe", "ignore"],
+        }),
+        source: `git:${ref}:${snapshotPath}`,
+      };
+    } catch {
+      // Try the next locally available ref. No network access is attempted.
+    }
+  }
+  throw new Error(
+    `no local Safari snapshot found; fetch/check out data-mirror or set MXGA_DATA_REF ` +
+      `(checked ${localSource} and refs: ${localRefs.join(", ") || "none"})`,
+  );
+}
+
 let raw;
 let source;
 if (offline) {
-  source = localSource;
-  raw = fs.readFileSync(localSource, "utf8");
+  ({ raw, source } = readLocalSnapshot());
 } else {
   try {
     const res = await fetch(remoteSource);
@@ -32,10 +65,9 @@ if (offline) {
   } catch (err) {
     console.warn(
       `WARN: fetch ${remoteSource} failed (${err.message}); ` +
-        `falling back to local snapshot, which may be stale: ${localSource}`,
+        "falling back to a locally available data-mirror snapshot",
     );
-    source = localSource;
-    raw = fs.readFileSync(localSource, "utf8");
+    ({ raw, source } = readLocalSnapshot());
   }
 }
 
@@ -74,7 +106,7 @@ if (artifact.count !== undefined) artifact.count = kept.length;
 fs.mkdirSync(path.dirname(destination), { recursive: true });
 fs.writeFileSync(destination, JSON.stringify(artifact));
 console.log(
-  `Prepared Safari fallback list from ${source === remoteSource ? "data-mirror branch" : "local snapshot"}: ` +
+  `Prepared Safari fallback list from ${source}: ` +
     `${artifact.entries.length} entries ` +
     `(${dropped} invalid rows dropped), ` +
     `${(fs.statSync(destination).size / 1024 / 1024).toFixed(2)} MB`,

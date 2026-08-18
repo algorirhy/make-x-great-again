@@ -204,10 +204,8 @@ apple/MXGA/           macOS 15+ / iOS 18+ 共用的 Xcode 工程（4 个平台 t
 services/edge/        Cloudflare Worker（Hono）+ D1（xss-db）
   src/index.ts        /v1/* API + scheduled cron + Env 类型
   src/pages/          SSR landing / list / admin（同套 base-ui design token）
-data/                 公开数据快照（Worker 每 6h 自动同步，git history = 审计日志）
-  whitelist/v1.json   维护者人工确认安全的账号
-  blacklist/v1.json   维护者人工确认公开的垃圾号（含 evidence_text + reasons）
-  README.md           schema 文档 + 更新机制说明
+data/                 指向 data-mirror 分支实时公开数据的说明
+  README.md           数据地址、schema 文档与更新机制
 docs/                 ARCHITECTURE / PRODUCT / MODERATION / FLOW / UX / STATUS / RUNNING / MVP
 GOVERNANCE.md         治理铁律 + 申诉路径（在仓库根）
 SECURITY.md           漏洞披露通道
@@ -216,7 +214,7 @@ CONTRIBUTING.md       贡献指南
 
 ## 公开数据集（审计入口）
 
-`data/whitelist/v1.json` 和 `data/blacklist/v1.json` 是这个项目最重要的透明度承诺 —— 它们是 D1 数据库的**只读快照**，每 6 小时由服务端自动同步到本仓库的 **`data-mirror` 分支**（2026-08-03 起独立成数据分支，避免自动数据提交与 `main` 上的代码开发相互覆盖；`main` 上的 `data/` 目录为当日冻结快照，不再更新）。**`data-mirror` 分支的 git history 就是完整审计日志**：任何人 clone 一下就能复现"维护者在哪天加了/移除了哪个账号"。
+`data/whitelist/v1.json` 和 `data/blacklist/v1.json` 是这个项目最重要的透明度承诺 —— 它们是 D1 数据库的**只读快照**，每 6 小时由服务端自动同步到本仓库的 **`data-mirror` 分支**（2026-08-03 起独立成数据分支，避免自动数据提交与 `main` 上的代码开发相互覆盖；2026-08-14 起 `main/data` 只保留指路 README，不再保留容易被误读的过期 JSON）。**`data-mirror` 分支的 git history 就是完整审计日志**：任何人 clone 一下就能复现"维护者在哪天加了/移除了哪个账号"。
 
 每条 blacklist 记录都附 `evidence_text`（触发判定的那条公开 X 文本）、`reasons`（AI 给出的理由数组）、`reporters`（独立举报人数），让审计不止是"我说他是 spam"。
 

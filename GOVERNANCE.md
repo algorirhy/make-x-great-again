@@ -63,9 +63,9 @@ published data.
   Worker's scheduled handler (diff-aware — only commits when content
   actually changed). Since 2026-08-03 the mirror writes to the dedicated
   [`data-mirror`](https://github.com/foru17/make-x-great-again/tree/data-mirror/data)
-  branch so automated data commits never race code work on `main` (the
-  `data/` copy on `main` is a frozen snapshot from that date). The git
-  history of that branch **is** the audit
+  branch so automated data commits never race code work on `main`; since
+  2026-08-14 `main/data` keeps only a pointer README. The git history of the
+  data branch **is** the audit
   log: anyone can clone and reconstruct "what was on the list at any past
   timestamp", including the `evidence_text` (the public X content that
   triggered each verdict) and `reasons` array (LLM-stated rationale). See

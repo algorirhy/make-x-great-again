@@ -26,6 +26,10 @@ otherwise.
 
 ### Changed
 
+- Merged upstream `main` data-mirror routing: live blacklist/whitelist JSON
+  now lives only on the `data-mirror` branch. Safari fallback preparation can
+  use an already-fetched local data ref when offline, and documentation no
+  longer claims that deleted frozen JSON remains on `main`.
 - Fixed a local-history race that could leave an account in `xss:blocked`
   without its `xss:blocklist:v2` audit row: all hide/record mutations now use
   one background-owned serialized writer and commit both keys together.
