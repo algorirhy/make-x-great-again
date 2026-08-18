@@ -1,8 +1,21 @@
 # MXGA · 公开数据集
 
+> 📍 **实时数据在 [`data-mirror` 分支](https://github.com/foru17/make-x-great-again/tree/data-mirror/data)，服务端每 6 小时自动同步，公开承诺不变。**
+>
+> `main` 上的本目录只保留这份指路 README：数据同步 2026-08-03 起独立到专用
+> 数据分支（自动数据提交每天几十次，和 `main` 上的代码开发相互覆盖、淹没代码
+> history），`main` 上残留的 2026-08-03 冻结快照又多次被误读成"名单停更了"，
+> 因此 2026-08-14 起把过期快照从 `main` 移除。**`data-mirror` 分支的 git
+> history 就是完整审计日志**，任何人 clone 即可复现每一次名单变更。
+>
+> 直接读取最新数据：
+> - 黑名单全量：`https://raw.githubusercontent.com/foru17/make-x-great-again/data-mirror/data/blacklist/v1.json`
+> - 黑名单 lite（扩展同款产物）：`https://raw.githubusercontent.com/foru17/make-x-great-again/data-mirror/data/blacklist/v2-lite.json`
+> - 白名单：`https://raw.githubusercontent.com/foru17/make-x-great-again/data-mirror/data/whitelist/v1.json`
+
 > 这个目录是 MXGA 服务端**自动生成**的公开数据快照。
 > 通过 Cloudflare Worker 的定时任务（每 6 小时）从 D1 数据库导出 →
-> 用 GitHub Contents API 写入这里。git history 即审计日志。
+> 用 GitHub Contents API 写入 `data-mirror` 分支。git history 即审计日志。
 
 完整治理规则：[GOVERNANCE.md](../GOVERNANCE.md) · 隐私承诺：[docs/PRIVACY.md](../docs/PRIVACY.md)
 
@@ -147,8 +160,8 @@ curl "https://cdn.jsdelivr.net/gh/foru17/make-x-great-again@latest/public-list/d
 
 ```bash
 # 最稳的入口（GitHub raw）
-curl https://raw.githubusercontent.com/foru17/make-x-great-again/main/data/blacklist/v1.json
-curl https://raw.githubusercontent.com/foru17/make-x-great-again/main/data/whitelist/v1.json
+curl https://raw.githubusercontent.com/foru17/make-x-great-again/data-mirror/data/blacklist/v1.json
+curl https://raw.githubusercontent.com/foru17/make-x-great-again/data-mirror/data/whitelist/v1.json
 ```
 
 ### 或者用我们的 Worker（带 CDN 缓存）
